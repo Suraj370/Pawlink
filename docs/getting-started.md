@@ -107,7 +107,15 @@ File-based routing (`apps/web/src/routes/`), route tree generated at build/dev t
   `queryClient.ensureQueryData(authMeQueryOptions)`; on failure it `throw redirect({ to: "/login" })`
   before the child route ever renders. This is the single place authentication is enforced for
   protected routes — child routes don't each re-implement the check.
-- `routes/_authenticated/dashboard.tsx` — the only protected route implemented in this milestone.
+- `routes/_authenticated/dashboard.tsx` — authenticated landing page.
+- `routes/_authenticated/pets/index.tsx`, `routes/_authenticated/pets/$petId.tsx` — pet management;
+  always private (a pet parent's own pets are never public data), so these live under the
+  authenticated layout.
+- `routes/providers/index.tsx`, `routes/providers/$providerId.tsx` — provider directory and
+  details. Deliberately **not** under `_authenticated`, since provider discovery is public by
+  design; owner-only controls (add/edit/deactivate a provider, and — on the details page — add/
+  edit/deactivate its services) are gated inline on the server-computed `isOwner` flag rather than
+  by route protection.
 
 ## TanStack Query architecture
 
@@ -122,6 +130,14 @@ File-based routing (`apps/web/src/routes/`), route tree generated at build/dev t
   API again and correctly gets a 401.
 - `features/system/api.ts` / `hooks.ts` — the same pattern for the public `GET /health` check shown
   on the landing page.
+- `features/pets/`, `features/providers/`, `features/services/` follow the identical
+  api.ts/hooks.ts/schemas.ts/components shape. Query keys: `["pets"]` / `["pets", petId]`,
+  `["providers", filters]` / `["providers", providerId]`, and
+  `["providers", providerId, "services"]` / `["providers", providerId, "services", serviceId]` —
+  the services keys are nested under their parent provider's id on purpose, so invalidating
+  `["providers", providerId, "services"]` after a service mutation can never accidentally touch a
+  different provider's service list. Every list query's filters are part of its key (see
+  `providersQueryOptions(filters)`), so two different filter combinations are cached separately.
 
 ## Ky architecture
 
@@ -129,6 +145,71 @@ File-based routing (`apps/web/src/routes/`), route tree generated at build/dev t
   (`VITE_API_URL`) and `credentials: "include"`. No other file constructs an HTTP request.
 - `lib/api/errors.ts` — `toErrorMessage()` unwraps Ky's `HTTPError` and extracts the API's
   `{ error: string }` JSON body so the UI can show a real message instead of a generic failure.
-- Feature API functions (`features/auth/api.ts`, `features/system/api.ts`) call `apiClient` and are
-  the only things TanStack Query hooks call — components never touch `apiClient` or `fetch`
-  directly.
+- Feature API functions (`features/{auth,system,pets,providers,services}/api.ts`) call `apiClient`
+  and are the only things TanStack Query hooks call — components never touch `apiClient` or
+  `fetch` directly (verified by grep as part of every milestone's verification step).
+
+## Pet management architecture
+
+- `pets` table: `owner_id` (FK → `users.id`, `ON DELETE CASCADE`, indexed). A pet belongs to
+  exactly one owner, derived solely from the session — `createPetSchema` has no `ownerId` field.
+- `GET/POST/PATCH/DELETE /api/pets*` all require authentication and are scoped by
+  `(id AND owner_id)`. A pet that exists but belongs to someone else returns `404`, identical to a
+  nonexistent id — never `403` — so a non-owner can't tell "not yours" from "doesn't exist".
+- `DELETE` is a real row delete (unlike providers/services below) — a pet has no downstream
+  entities referencing it yet in this codebase, so there's no historical-record reason to soft
+  delete it.
+
+## Provider management architecture
+
+- `providers` table: `owner_user_id` (FK → `users.id`, cascade, indexed), plus indexes on
+  `provider_type`, `status`, and `city` for the public discovery query's filters.
+- `GET /api/providers` and `GET /api/providers/:id` are **public**; `POST`/`PATCH`/`DELETE`
+  require authentication and ownership (or an admin).
+- Public responses never include the raw `owner_user_id` — a computed `isOwner` boolean (true only
+  for the authenticated owner or an admin) lets the UI show/hide Edit/Deactivate controls without
+  the foreign key ever leaving the server.
+- **Status model**: `ACTIVE` / `INACTIVE` / `SUSPENDED`. An owner may freely toggle their own
+  provider between `ACTIVE` and `INACTIVE`. `SUSPENDED` is admin-only in two independent layers:
+  the owner-facing Zod schema doesn't even accept `SUSPENDED` as a legal shape, and
+  `assertStatusTransitionAllowed()` additionally blocks anyone but an admin from changing the
+  status of an already-`SUSPENDED` provider (closing the "owner just sets `ACTIVE` to un-suspend
+  themselves" loophole).
+- `DELETE /api/providers/:id` is a **soft deactivation** (`status -> INACTIVE`), not a row delete —
+  see Service management below for why this matters once services exist under a provider.
+- Public discovery (`GET /api/providers`) only ever returns `ACTIVE` providers; any client-supplied
+  `status` filter is ignored for non-owner/non-admin requests, so a stranger can't use it to
+  enumerate `INACTIVE`/`SUSPENDED` listings.
+
+## Service management architecture
+
+- `services` table, nested under a provider: `provider_id` (FK → `providers.id`, cascade),
+  indexed on `provider_id` alone and on the composite `(provider_id, active)` — the latter covers
+  the exact predicate public discovery uses. `duration_minutes > 0` and `price_minor >= 0` are
+  enforced as **Postgres CHECK constraints**, not just Zod, so even a direct/buggy write can't
+  violate them (verified against a live database — see the migration for details).
+- **No unique constraint on `(provider_id, name)`** — a deliberate decision: a provider may
+  legitimately want to reuse a name after deactivating an earlier variant (e.g. a seasonal
+  offering), and since deactivation is soft, a hard uniqueness constraint would fight the
+  deactivate-then-recreate workflow for no real data-integrity benefit.
+- **Money representation**: prices are stored and transmitted as `priceMinor`, an **integer** count
+  of the currency's smallest unit (₹799.00 → `79900` paise) — never a float, so no floating-point
+  rounding can creep into a persisted price. The frontend's only decimal-string ↔ integer
+  conversion (`features/services/money.ts`) is done with string splitting and integer arithmetic,
+  deliberately avoiding any decimal float multiplication even at the input boundary.
+- Nested routes: `GET/POST /api/providers/:providerId/services`,
+  `GET/PATCH/DELETE /api/providers/:providerId/services/:serviceId`. Every service lookup is
+  scoped by **both** `id` and `provider_id` together — this is the direct defense against a
+  service id from one provider being reachable through a different provider's URL segment
+  (`/providers/provider-B-id/services/service-from-provider-A-id` resolves to nothing, even though
+  the service id itself is real).
+- Ownership of the *provider* (not a separate service-level owner field) gates every mutation —
+  `createServiceSchema` has no `providerId` field at all; it comes solely from the URL, and that
+  provider's ownership is checked against the session before the request body is even parsed.
+- `DELETE` is a **soft deactivation** (`active -> false`), not a row delete — the future booking
+  system will need to reference the exact service a customer selected, and a hard delete would
+  make that historical reference impossible to preserve. Reactivation is
+  `PATCH { active: true }`, not a separate endpoint.
+- Public discovery shows only active services of an active, publicly-visible provider; the
+  provider owner (or an admin) additionally sees their own inactive services in the same list
+  response, for their management view.

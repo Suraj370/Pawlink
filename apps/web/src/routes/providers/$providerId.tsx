@@ -4,6 +4,7 @@ import { Link, createFileRoute } from "@tanstack/react-router"
 import { Button } from "@/components/ui/button"
 import { ProviderForm } from "@/features/providers/components/ProviderForm"
 import { useDeactivateProvider, useProvider, useUpdateProvider } from "@/features/providers/hooks"
+import { ServiceList } from "@/features/services/components/ServiceList"
 
 export const Route = createFileRoute("/providers/$providerId")({
   component: ProviderDetailsPage,
@@ -131,6 +132,7 @@ function ProviderDetailsPage() {
           </Button>
         </div>
       )}
+      <ServiceList providerId={provider.id} isOwner={provider.isOwner} />
     </main>
   )
 }
