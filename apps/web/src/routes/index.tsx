@@ -28,6 +28,9 @@ function HomePage() {
         <Link to="/register" className="underline underline-offset-4">
           Register
         </Link>
+        <Link to="/providers" className="underline underline-offset-4">
+          Browse Providers
+        </Link>
       </nav>
     </main>
   )

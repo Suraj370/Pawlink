@@ -8,6 +8,7 @@ import type { DbClient } from "./db/client.js";
 import type { Env } from "./env.js";
 import { createAuthRoutes } from "./routes/auth.js";
 import { createPetRoutes } from "./routes/pets.js";
+import { createProviderRoutes } from "./routes/providers.js";
 
 export function createApp(db: DbClient, env: Env) {
   const app = new Hono<AppEnv>();
@@ -32,6 +33,7 @@ export function createApp(db: DbClient, env: Env) {
 
   app.route("/api/auth", createAuthRoutes(db, env.NODE_ENV));
   app.route("/api/pets", createPetRoutes(db, env.NODE_ENV));
+  app.route("/api/providers", createProviderRoutes(db, env.NODE_ENV));
 
   app.notFound((c) => {
     return c.json({ error: "Not Found" }, 404);

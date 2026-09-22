@@ -33,6 +33,9 @@ function DashboardPage() {
       <Link to="/pets" className="text-sm underline underline-offset-4 w-fit">
         My Pets
       </Link>
+      <Link to="/providers" className="text-sm underline underline-offset-4 w-fit">
+        Providers
+      </Link>
       <Button onClick={handleLogout} isDisabled={logout.isPending} className="w-fit">
         {logout.isPending ? "Logging out…" : "Log out"}
       </Button>
