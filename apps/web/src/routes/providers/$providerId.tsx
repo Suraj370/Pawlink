@@ -5,6 +5,9 @@ import { Button } from "@/components/ui/button"
 import { ProviderForm } from "@/features/providers/components/ProviderForm"
 import { useDeactivateProvider, useProvider, useUpdateProvider } from "@/features/providers/hooks"
 import { ServiceList } from "@/features/services/components/ServiceList"
+import { ExceptionsManager } from "@/features/availability/components/ExceptionsManager"
+import { SlotPicker } from "@/features/availability/components/SlotPicker"
+import { WeeklyRulesManager } from "@/features/availability/components/WeeklyRulesManager"
 
 export const Route = createFileRoute("/providers/$providerId")({
   component: ProviderDetailsPage,
@@ -70,6 +73,7 @@ function ProviderDetailsPage() {
             postalCode: provider.postalCode ?? "",
             latitude: provider.latitude != null ? String(provider.latitude) : "",
             longitude: provider.longitude != null ? String(provider.longitude) : "",
+            timezone: provider.timezone,
           }}
           onSubmit={async (input) => {
             await updateProvider.mutateAsync(input)
@@ -110,6 +114,12 @@ function ProviderDetailsPage() {
         <dd>{provider.phone ?? "—"}</dd>
         <dt className="text-muted-foreground">Email</dt>
         <dd>{provider.email ?? "—"}</dd>
+        {provider.isOwner && (
+          <>
+            <dt className="text-muted-foreground">Timezone</dt>
+            <dd data-testid="provider-timezone">{provider.timezone}</dd>
+          </>
+        )}
       </dl>
       {deactivateError && (
         <p role="alert" className="text-sm text-destructive">
@@ -133,6 +143,14 @@ function ProviderDetailsPage() {
         </div>
       )}
       <ServiceList providerId={provider.id} isOwner={provider.isOwner} />
+      {provider.isOwner && (
+        <div className="flex flex-col gap-6 border-t border-border pt-6">
+          <h2 className="text-lg font-semibold">Availability</h2>
+          <WeeklyRulesManager providerId={provider.id} />
+          <ExceptionsManager providerId={provider.id} />
+        </div>
+      )}
+      <SlotPicker providerId={provider.id} />
     </main>
   )
 }

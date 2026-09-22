@@ -16,6 +16,7 @@ export type ProviderFormValues = {
   postalCode: string
   latitude: string
   longitude: string
+  timezone: string
 }
 
 const EMPTY_VALUES: ProviderFormValues = {
@@ -30,6 +31,7 @@ const EMPTY_VALUES: ProviderFormValues = {
   postalCode: "",
   latitude: "",
   longitude: "",
+  timezone: "UTC",
 }
 
 type Props = {
@@ -180,6 +182,16 @@ export function ProviderForm({ initialValues, submitLabel, pending, onSubmit, on
           value={values.longitude}
           onChange={(e) => update("longitude", e.target.value)}
           className="rounded border border-border bg-background px-3 py-2 text-sm"
+        />
+      </label>
+      <label className="flex flex-col gap-1 text-sm">
+        Timezone (IANA, e.g. Asia/Kolkata)
+        <input
+          type="text"
+          value={values.timezone}
+          onChange={(e) => update("timezone", e.target.value)}
+          className="rounded border border-border bg-background px-3 py-2 text-sm"
+          placeholder="Asia/Kolkata"
         />
       </label>
       {(fieldError ?? submitError) && (

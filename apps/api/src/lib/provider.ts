@@ -17,6 +17,7 @@ export function toPublicProvider(provider: ProviderRow, isOwner: boolean): Publi
     postalCode: provider.postalCode,
     latitude: provider.latitude,
     longitude: provider.longitude,
+    timezone: provider.timezone,
     status: provider.status,
     isOwner,
     createdAt: provider.createdAt.toISOString(),

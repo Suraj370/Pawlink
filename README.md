@@ -2,8 +2,8 @@
 
 A multi-sided pet-care platform connecting pet parents, vets, groomers, boarding providers, and
 platform administrators. This repository currently implements the project foundation,
-authentication, pet management, provider management, and service management — no other business
-features are implemented yet.
+authentication, pet management, provider management, service management, and availability
+management — no other business features are implemented yet.
 
 ## Stack
 
@@ -21,16 +21,18 @@ features are implemented yet.
 
 ```text
 apps/
-  api/      Hono API service (health check, auth, pets, providers, services)
+  api/      Hono API service (health check, auth, pets, providers, services, availability)
   web/      React/Vite frontend (TanStack Router/Query, Ky, shadcn/Tailwind UI)
 packages/
-  shared/   Shared types & Zod schemas (health, auth, pets, providers, services) used by both apps
+  shared/   Shared types & Zod schemas (health, auth, pets, providers, services, availability)
 e2e/        Playwright end-to-end tests
 docs/       Project documentation
 ```
 
-See [docs/getting-started.md](docs/getting-started.md) for setup, environment variables, and the
-authentication/pets/providers/services/TanStack Router/Query/Ky architecture.
+See [docs/getting-started.md](docs/getting-started.md) for setup and environment variables,
+[docs/architecture.md](docs/architecture.md) for how each milestone (especially availability's
+timezone/scheduling model) actually works, and [docs/testing.md](docs/testing.md) for how to run
+and what each layer of the test suite covers.
 
 ## Status
 
@@ -49,6 +51,14 @@ authentication/pets/providers/services/TanStack Router/Query/Ky architecture.
   (`/api/providers/:providerId/services`) — name, duration, price, currency. Public discovery shows
   only active services of an active provider; deactivation is a soft delete (row kept, `active` set
   to `false`) so a future booking system can still reference the exact service that was selected.
+- **Availability management**: a provider owner sets recurring weekly hours (with support for
+  split schedules — multiple windows per day) and date-specific exceptions (closed, or custom
+  hours). `GET /api/providers/:providerId/availability?date=...&serviceId=...` calculates the
+  actual bookable start times for that date and service, respecting the provider's own IANA
+  timezone, the service's duration, and provider/service active status. This is a **calculation
+  only** — no slot is reserved, locked, or turned into a booking; the same slot can currently be
+  seen by more than one customer. See [docs/architecture.md](docs/architecture.md) for the full
+  model.
 
-Other product features (availability, bookings, payments, medical records, notifications, AI) are
-not implemented yet and are separate milestones.
+Other product features (bookings, payments, medical records, notifications, AI) are not
+implemented yet and are separate milestones.

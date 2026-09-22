@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { timezoneSchema } from "./availability.js";
 
 export const PROVIDER_TYPE_VALUES = ["VET", "GROOMER", "BOARDING_PROVIDER", "PET_SHOP"] as const;
 export const providerTypeSchema = z.enum(PROVIDER_TYPE_VALUES);
@@ -47,6 +48,12 @@ const optionalLongitude = z.preprocess(
 // Only a business name and a provider type are required to list a
 // provider at all; every contact/location field is optional so a listing
 // can be created and filled in incrementally.
+//
+// timezone is optional on input (defaults to "UTC" server-side if omitted
+// — see routes/providers.ts) but, when supplied, must be a genuine IANA
+// identifier: a provider always HAS an explicit timezone, it just isn't
+// mandatory to state one on every create call to avoid breaking existing
+// provider-creation flows from before availability management existed.
 export const providerInputSchema = z.object({
   businessName: z.string().trim().min(1, "Business name is required").max(200),
   providerType: providerTypeSchema,
@@ -59,6 +66,7 @@ export const providerInputSchema = z.object({
   postalCode: optionalTrimmedString(20),
   latitude: optionalLatitude,
   longitude: optionalLongitude,
+  timezone: timezoneSchema.optional(),
 });
 
 // Creation never accepts ownerId or status: ownership is derived from the
@@ -101,6 +109,7 @@ export const publicProviderSchema = z.object({
   postalCode: z.string().nullable(),
   latitude: z.number().nullable(),
   longitude: z.number().nullable(),
+  timezone: z.string(),
   status: providerStatusSchema,
   isOwner: z.boolean(),
   createdAt: z.string(),
