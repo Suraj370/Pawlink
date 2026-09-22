@@ -1,4 +1,4 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router"
+import { Link, createFileRoute, useNavigate } from "@tanstack/react-router"
 import { Button } from "@/components/ui/button"
 import { useCurrentUser, useLogout } from "@/features/auth/hooks"
 
@@ -30,6 +30,9 @@ function DashboardPage() {
         <dt className="text-muted-foreground">Role</dt>
         <dd>{user?.role}</dd>
       </dl>
+      <Link to="/pets" className="text-sm underline underline-offset-4 w-fit">
+        My Pets
+      </Link>
       <Button onClick={handleLogout} isDisabled={logout.isPending} className="w-fit">
         {logout.isPending ? "Logging out…" : "Log out"}
       </Button>
