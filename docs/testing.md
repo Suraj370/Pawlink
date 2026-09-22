@@ -13,6 +13,14 @@ Postgres must be running and migrated first (`npm run db:up && npm run db:migrat
 [docs/getting-started.md](getting-started.md)). Playwright's config starts both the API and web dev
 servers automatically but cannot start PostgreSQL itself.
 
+`playwright.config.ts` caps `workers` at 4 rather than using Playwright's CPU-count default. Every
+spec drives a real browser against one shared dev API/Postgres instance (nothing is mocked), and the
+booking specs in particular run multi-step, multi-context workflows; at full default parallelism on
+a typical dev machine, that single shared backend gets oversubscribed badly enough that the heavier
+specs can time out from pure contention — the same spec that timed out at 90s under full parallelism
+completed in ~5s run in isolation. Raise the cap if running on a beefier machine or a dedicated CI
+runner.
+
 ## Test layers
 
 ### 1. Pure unit tests (`apps/api/src/lib/*.test.ts`)
@@ -39,7 +47,7 @@ wall-clock time, sleep, or network — they're fast and can't flake.
 
 ### 2. API/integration tests (`apps/api/src/*.test.ts`, one file per resource)
 
-Each resource (`auth`, `pets`, `providers`, `services`, `availability`) has a test file that drives
+Each resource (`auth`, `pets`, `providers`, `services`, `availability`, `bookings`) has a test file that drives
 the real Hono app (`app.request(...)`) against the real Postgres database (no mocking) — this
 exercises routing, Zod validation, database constraints, and authorization together. Every resource
 file follows the same shape:
@@ -90,6 +98,36 @@ configured schedule exactly, confirm a slot click doesn't create anything) and t
 workflow (select a service and date on a public provider page with no login, see slots matching the
 configured schedule), plus a dedicated case confirming an inactive provider/service exposes no
 `SlotPicker` at all.
+
+`e2e/bookings.spec.ts` covers the full customer workflow end to end (register, add a pet, pick a
+service and slot on a real provider another user set up, review, confirm, see the confirmation, find
+it in "My Bookings", then reload availability and confirm the exact slot — and any other slot that
+would now overlap it — no longer appears) and cancellation (cancel from the booking detail page,
+confirm the slot becomes bookable again). `e2e/bookings-security.spec.ts` is the mandatory
+cross-user proof: User B gets "not found" in the UI and a `404` directly against
+`GET/POST /api/bookings/:id`(`/cancel`) for User A's booking, and a `404` attempting to book using
+User A's own pet id.
+
+### 5. Concurrency and idempotency tests (`apps/api/src/bookings.test.ts`)
+
+Two categories of test exist nowhere else in this codebase, because no earlier milestone had a
+genuine race condition to prove correct:
+
+- **The mandatory double-booking race test**: two `Promise.all`-concurrent `POST /api/bookings`
+  requests for the exact same provider/slot from two different customers. Asserts exactly one `201`
+  and one clean `409` (never two `201`s, never a raw database error surfacing), and then
+  independently re-queries the database (via the provider owner's booking list) to confirm exactly
+  one `CONFIRMED` booking actually exists for that appointment — the HTTP responses alone aren't
+  trusted as the proof. The same scenario is also verified with real concurrent `curl` processes
+  against the live dev server (not just Vitest's in-process request calls), confirming the guarantee
+  holds under actual concurrent network requests, not just concurrent JavaScript promises.
+- **Idempotency tests**: same key + same request replays the original booking (`200`, not a second
+  `201`); same key + different request is a `409` conflict; a genuinely concurrent pair of requests
+  sharing one key converge on a single booking id; a request with no key at all is never
+  deduplicated. One real bug was caught and fixed by this suite during development: the availability
+  re-validation originally ran *before* the idempotency check, so a legitimate sequential replay was
+  incorrectly rejected as "slot no longer available" (because the original request's own booking was
+  now correctly occupying that slot) — fixed by checking for an existing idempotency claim first.
 
 ## What "passing" actually means here
 

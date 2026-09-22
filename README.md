@@ -2,8 +2,8 @@
 
 A multi-sided pet-care platform connecting pet parents, vets, groomers, boarding providers, and
 platform administrators. This repository currently implements the project foundation,
-authentication, pet management, provider management, service management, and availability
-management — no other business features are implemented yet.
+authentication, pet management, provider management, service management, availability management,
+and the booking engine — no other business features are implemented yet.
 
 ## Stack
 
@@ -17,14 +17,29 @@ management — no other business features are implemented yet.
 - Vitest (unit/integration tests) + Playwright (E2E)
 - Docker Compose (local Postgres)
 
+## Quickstart
+
+```bash
+npm install
+cp apps/api/.env.example apps/api/.env
+cp apps/web/.env.example apps/web/.env
+npm run db:up
+npm run db:migrate
+npm run dev:api   # http://localhost:3000
+npm run dev:web   # http://localhost:5173
+```
+
+Full setup details, environment variables, and prerequisites live in
+[docs/getting-started.md](docs/getting-started.md).
+
 ## Structure
 
 ```text
 apps/
-  api/      Hono API service (health check, auth, pets, providers, services, availability)
+  api/      Hono API service (health check, auth, pets, providers, services, availability, bookings)
   web/      React/Vite frontend (TanStack Router/Query, Ky, shadcn/Tailwind UI)
 packages/
-  shared/   Shared types & Zod schemas (health, auth, pets, providers, services, availability)
+  shared/   Shared types & Zod schemas (health, auth, pets, providers, services, availability, bookings)
 e2e/        Playwright end-to-end tests
 docs/       Project documentation
 ```
@@ -33,6 +48,24 @@ See [docs/getting-started.md](docs/getting-started.md) for setup and environment
 [docs/architecture.md](docs/architecture.md) for how each milestone (especially availability's
 timezone/scheduling model) actually works, and [docs/testing.md](docs/testing.md) for how to run
 and what each layer of the test suite covers.
+
+## API surface
+
+| Resource       | Endpoints                                                                                   | Auth |
+| -------------- | --------------------------------------------------------------------------------------------- | ---- |
+| Health         | `GET /health`                                                                                   | public |
+| Auth           | `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me` | mixed |
+| Pets           | `GET/POST /api/pets`, `GET/PATCH/DELETE /api/pets/:id`                                        | owner |
+| Providers      | `GET /api/providers`, `GET /api/providers/:id`, `POST/PATCH/DELETE /api/providers[/:id]`       | GET public, writes owner/admin |
+| Services       | `GET/POST /api/providers/:providerId/services`, `GET/PATCH/DELETE .../services/:serviceId`     | GET public, writes owner/admin |
+| Availability   | `GET /api/providers/:providerId/availability?date&serviceId`                                   | public |
+|                | `GET/POST /api/providers/:providerId/availability/rules[/:ruleId]` (+ `PATCH`/`DELETE`)         | owner/admin |
+|                | `GET/POST /api/providers/:providerId/availability/exceptions[/:exceptionId]` (+ `PATCH`/`DELETE`) | owner/admin |
+| Bookings       | `POST/GET /api/bookings`, `GET /api/bookings/:id`, `POST /api/bookings/:id/cancel`               | authenticated |
+
+Every mutating endpoint derives ownership from the authenticated session, never from a
+client-supplied id. Full request/response shapes and the authorization model are documented in
+[docs/architecture.md](docs/architecture.md).
 
 ## Status
 
@@ -59,6 +92,30 @@ and what each layer of the test suite covers.
   only** — no slot is reserved, locked, or turned into a booking; the same slot can currently be
   seen by more than one customer. See [docs/architecture.md](docs/architecture.md) for the full
   model.
+- **Booking engine**: `POST /api/bookings` turns one specific advisory availability slot into an
+  actual reservation — re-validating everything the availability endpoint checks server-side (never
+  trusting the client's own availability lookup), deriving the customer from the session and the
+  price/duration/service-name from the service *as it exists at booking time* (captured as an
+  immutable snapshot). Two customers can never successfully reserve the same overlapping
+  appointment: a Postgres `EXCLUDE` constraint makes that impossible at the database level, not just
+  in application code, verified under real concurrent requests. Duplicate submissions are protected
+  by a persistent `Idempotency-Key` mechanism. Bookings are never hard-deleted — cancellation is a
+  status transition, governed by an explicit state machine. See
+  [docs/architecture.md](docs/architecture.md) for the full design.
 
-Other product features (bookings, payments, medical records, notifications, AI) are not
-implemented yet and are separate milestones.
+Other product features (payments, medical records, notifications, AI) are not implemented yet and
+are separate milestones.
+
+## Testing
+
+```bash
+npm run typecheck   # TypeScript checks across all workspaces
+npm run test         # backend unit/integration tests (Vitest)
+npm run test:e2e     # end-to-end tests (Playwright)
+npm run build         # production build of all workspaces
+```
+
+Postgres must be running and migrated first (`npm run db:up && npm run db:migrate`). Every
+resource has a matching `*-security.spec.ts` Playwright spec that proves authorization directly
+against the API, not just through the UI. See [docs/testing.md](docs/testing.md) for what each
+test layer covers.

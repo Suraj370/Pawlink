@@ -18,6 +18,11 @@ const petIdSchema = z.string().uuid();
 // all) is treated as a distinct 400 validation error.
 const NOT_FOUND = { error: "Pet not found" } as const;
 
+const FOREIGN_KEY_VIOLATION = "23503";
+function isForeignKeyViolation(err: unknown): boolean {
+  return typeof err === "object" && err !== null && "code" in err && (err as { code: unknown }).code === FOREIGN_KEY_VIOLATION;
+}
+
 export function createPetRoutes(db: DbClient, nodeEnv: string) {
   const app = new Hono<AppEnv>();
   const requireAuth = createRequireAuth(db, nodeEnv);
@@ -128,7 +133,18 @@ export function createPetRoutes(db: DbClient, nodeEnv: string) {
       return c.json(NOT_FOUND, 404);
     }
 
-    await db.delete(pets).where(and(eq(pets.id, idResult.data), eq(pets.ownerId, user.id)));
+    try {
+      await db.delete(pets).where(and(eq(pets.id, idResult.data), eq(pets.ownerId, user.id)));
+    } catch (err) {
+      // A pet with booking history can't be deleted — bookings.pet_id is a
+      // restrict (never cascade) FK precisely so a pet's booking history
+      // can never be silently destroyed. Surfaced as a clean 409 instead
+      // of a raw database error.
+      if (isForeignKeyViolation(err)) {
+        return c.json({ error: "This pet has existing bookings and cannot be deleted" }, 409);
+      }
+      throw err;
+    }
 
     return c.json({ success: true }, 200);
   });

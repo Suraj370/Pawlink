@@ -8,6 +8,7 @@ import { ServiceList } from "@/features/services/components/ServiceList"
 import { ExceptionsManager } from "@/features/availability/components/ExceptionsManager"
 import { SlotPicker } from "@/features/availability/components/SlotPicker"
 import { WeeklyRulesManager } from "@/features/availability/components/WeeklyRulesManager"
+import { ProviderBookingsPanel } from "@/features/bookings/components/ProviderBookingsPanel"
 
 export const Route = createFileRoute("/providers/$providerId")({
   component: ProviderDetailsPage,
@@ -148,6 +149,11 @@ function ProviderDetailsPage() {
           <h2 className="text-lg font-semibold">Availability</h2>
           <WeeklyRulesManager providerId={provider.id} />
           <ExceptionsManager providerId={provider.id} />
+        </div>
+      )}
+      {provider.isOwner && (
+        <div className="border-t border-border pt-6">
+          <ProviderBookingsPanel providerId={provider.id} />
         </div>
       )}
       <SlotPicker providerId={provider.id} />

@@ -118,6 +118,16 @@ export function formatZonedIso(date: Date, timeZone: string): string {
   );
 }
 
+// The calendar date (in `timeZone`) that a UTC instant falls on — the
+// inverse of the date-selection half of zonedTimeToUtc. Used when
+// re-validating a client-submitted booking instant: which weekly
+// rule/exception date does this instant actually correspond to in the
+// *provider's* timezone, not the server's or the client's.
+export function zonedDateString(date: Date, timeZone: string): string {
+  const p = partsAt(date.getTime(), timeZone);
+  return `${p.year}-${pad2(p.month)}-${pad2(p.day)}`;
+}
+
 const DAY_NAMES = ["SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"] as const;
 
 // The day of the week for a calendar date (e.g. "2026-10-05" -> "MONDAY")

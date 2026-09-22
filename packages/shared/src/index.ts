@@ -13,3 +13,4 @@ export * from "./pets.js";
 export * from "./providers.js";
 export * from "./services.js";
 export * from "./availability.js";
+export * from "./bookings.js";

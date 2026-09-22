@@ -7,7 +7,7 @@ authentication/TanStack Router/Query/Ky patterns shared across every feature.
 
 ## Foundation & cross-cutting patterns
 
-Every feature (pets, providers, services, availability) follows the same shape:
+Every feature (pets, providers, services, availability, bookings) follows the same shape:
 
 - **Backend**: a Drizzle table in `apps/api/src/db/schema.ts`, a Zod schema in
   `packages/shared/src/<feature>.ts` (shared between API validation and frontend form validation —
@@ -180,3 +180,153 @@ answers "what could a customer book right now," which has no meaningful answer f
 service that isn't currently bookable. Availability rows are never deleted when a provider becomes
 inactive; provider/service status is the single higher-level visibility switch, checked at query
 time.
+
+## Booking engine
+
+### The central boundary: availability is advisory, booking is authoritative
+
+> Availability tells us what *could* be booked. Booking atomically decides what *actually gets
+> reserved.* A successful `POST /api/bookings` is the only point at which a slot becomes reserved.
+
+`calculateAvailableSlots` (availability's pure function) knows nothing about bookings, and stays
+that way. The one place the two connect is a post-filter:
+`excludeBookedSlots` (`apps/api/src/lib/booking.ts`) removes any candidate slot that overlaps an
+existing `PENDING`/`CONFIRMED`/`COMPLETED` booking for that provider, applied both by the public
+availability endpoint (so an already-taken slot simply isn't offered) and by booking creation
+itself (so a client that skipped calling availability first still gets rejected). This is
+deliberately *not* a second scheduling algorithm — it's pure interval subtraction over the same
+candidate list `calculateAvailableSlots` already produced.
+
+Booking creation never trusts the client's own prior availability lookup. `POST /api/bookings`
+independently re-derives and re-checks everything: provider is `ACTIVE`, the service is `active`
+and actually belongs to that provider, the pet belongs to the authenticated customer, and — reusing
+`calculateAvailableSlots` again, not a duplicate implementation — that the requested `startAt`
+instant is genuinely a member of the current legal slot list (which enforces slot-interval
+alignment, full-duration-fits-in-window, exception precedence, and not-in-the-past all through that
+one reused call).
+
+### Historical snapshots
+
+A booking is created for the pet-care service *as it exists at that moment* — `priceMinor`,
+`currency`, `serviceNameSnapshot`, and `serviceDurationMinutesSnapshot` are copied from the service
+row once, at creation time, and never recalculated. If the provider later renames the service,
+changes its price or duration, or deactivates it entirely, every booking already made against it
+keeps showing exactly what the customer actually booked and paid for. `endAt` is likewise computed
+once at creation (`startAt + serviceDurationMinutesSnapshot`) and is never client-supplied —
+`createBookingSchema` has no `endAt`, `priceMinor`, `currency`, `serviceName`, `status`, or
+`customerUserId` field at all, so none of them can be set by the request body regardless of what a
+client sends (verified by a test that submits all of them and asserts the server-derived values won
+instead).
+
+### Booking lifecycle
+
+```text
+PENDING   -> CONFIRMED | CANCELLED
+CONFIRMED -> CANCELLED | COMPLETED
+CANCELLED, COMPLETED: terminal — no transitions out.
+```
+
+Enforced by a single authoritative function, `assertBookingStatusTransition`
+(`apps/api/src/lib/booking.ts`), not scattered ad hoc status checks. Every booking created through
+today's API goes directly to `CONFIRMED` — there is no payment or manual-provider-approval gate yet
+that would justify holding it in `PENDING` first — but `PENDING` remains a fully legal, tested state
+in the schema and transition table rather than a stub, since it's the natural hook for a future
+payment-hold or manual-confirmation flow. `COMPLETED` is a legal transition target with no endpoint
+that currently produces it (no "mark completed" action or automatic post-appointment job exists —
+deliberately out of scope for this milestone, see Known limitations below). Cancellation
+(`POST /api/bookings/:id/cancel`) only ever changes `status`; the row is never deleted, because a
+booking is a historical business record.
+
+Which statuses occupy a provider's calendar (`BLOCKING_BOOKING_STATUSES`,
+`packages/shared/src/bookings.ts`) is `PENDING`, `CONFIRMED`, and `COMPLETED` — `CANCELLED` never
+blocks a new booking over the same time range. This single constant is the source of truth for
+three independent places that all need to agree with it: `excludeBookedSlots`'s filtering, the
+database `EXCLUDE` constraint's `WHERE` clause (see below), and nowhere else — there is no fourth
+copy of this list anywhere in the codebase.
+
+### Preventing double-booking: a database-enforced invariant, not an application check
+
+A naive "check for a conflict, then insert" is a textbook race: two concurrent requests can both
+pass the check before either has inserted. This is solved with a Postgres **`EXCLUDE` constraint**,
+not application-level locking or a pre-insert `SELECT`:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+ALTER TABLE bookings ADD CONSTRAINT bookings_no_overlapping_active
+  EXCLUDE USING gist (
+    provider_id WITH =,
+    tstzrange(start_at, end_at) WITH &&
+  )
+  WHERE (status IN ('PENDING', 'CONFIRMED', 'COMPLETED'));
+```
+
+This makes "two active bookings for the same provider with overlapping time ranges" a state the
+database itself will never contain, regardless of what application code does — including a future
+regression that reintroduces a race in application logic. `btree_gist` is required because
+`provider_id` (normally compared with plain btree equality) needs a GiST-compatible equality
+operator class to combine with the range-overlap operator (`&&`) in one exclusion constraint;
+evaluated and introduced specifically for this guarantee, not for general use. The range defaults
+to half-open (`[start_at, end_at)`), so a booking ending at 10:00 never conflicts with one starting
+at 10:00 — consistent with every other overlap check in the codebase (weekly-window overlap,
+`excludeBookedSlots`).
+
+Drizzle-kit 0.24.2 has no API for exclusion constraints at all (and, as with every other migration
+in this repository, doesn't emit plain `CHECK` constraints either), so this SQL — along with the
+`CHECK (end_at > start_at)` and `CHECK (price_minor >= 0)` constraints — was added to the generated
+migration by hand. **Verified directly against Postgres**, bypassing the API entirely: an overlapping
+insert is rejected with an `exclusion_violation` (`23P01`), a back-to-back insert (ending exactly
+when another starts) succeeds, and an overlapping `CANCELLED` insert succeeds (cancelled bookings
+never block). Also verified under real concurrent HTTP requests (two simultaneous `curl` calls for
+the same slot, and the equivalent Vitest test firing two `Promise.all`-concurrent requests): exactly
+one succeeds (`201`), the other gets a clean `409` — the route catches the `23P01` error code and
+returns `{ "error": "This time slot was just booked by someone else" }`, never a raw database error.
+
+### Idempotency
+
+`POST /api/bookings` accepts an optional `Idempotency-Key` header. Keys are scoped per customer
+(`booking_idempotency_keys`, composite primary key `(customer_user_id, key)`) — one customer can
+never collide with or observe another's key. A `request_hash` (SHA-256 of the canonicalized
+`{providerId, serviceId, petId, startAt}`) distinguishes a safe replay of the *same* request from
+reuse of the same key for a *materially different* one:
+
+- **Same key, same request** (including a genuinely concurrent duplicate): the second request
+  receives the *same* booking back (`200`, not a new `201`).
+- **Same key, different parameters**: `409 Conflict` — the original booking is never silently
+  mutated.
+- **No key**: no deduplication at all; every request is independent.
+- **No expiry**: a key remains valid to safely retry indefinitely. A time-bounded expiry would need
+  a cleanup job, out of scope for this milestone (see Known limitations).
+
+The mechanism is checked in **two places**, deliberately: first as a plain read *before* the
+availability re-validation (so a sequential replay of an already-succeeded request isn't wrongly
+rejected by the availability check, since the booking IT created is now correctly occupying that
+exact slot), and second as the actual transactional claim, inside the same database transaction
+that creates the booking. That second check is what makes truly concurrent same-key requests
+correct: the claim is `INSERT ... ON CONFLICT DO NOTHING` against the composite primary key, so a
+second concurrent transaction attempting the same insert is blocked by Postgres's ordinary row lock
+until the first transaction commits (with the booking id filled in) or rolls back (with the row
+gone entirely) — no polling, no manual locking, just relying on standard transactional semantics.
+Verified with a real `Promise.all`-concurrent test asserting both responses converge on one booking
+id.
+
+### Provider/service change scenarios (verified by test)
+
+| Scenario | Behavior |
+| --- | --- |
+| Service becomes inactive after availability was shown | Booking attempt fails (`409`) |
+| Provider becomes inactive after availability was shown | Booking attempt fails (`409`) |
+| Service price/name/duration changes after a booking exists | Existing booking keeps its original snapshot values, unaffected |
+| Service is deactivated after a booking exists | Existing booking remains valid and viewable; only *new* bookings against it are blocked |
+| A pet has existing booking history | `DELETE /api/pets/:id` is rejected (`409`) rather than leaving a booking pointing at a vanished pet — `bookings.pet_id`/`provider_id`/`service_id` are `RESTRICT` foreign keys, never `CASCADE`, and the pets route now catches that FK violation and returns a clean error instead of a raw `500` |
+
+### Known limitations
+
+- No endpoint or job currently transitions a booking to `COMPLETED` — it's a legal state in the
+  transition table, but nothing produces it yet (would be an automatic post-appointment-time job or
+  a provider "mark complete" action; deliberately out of scope here).
+- `PENDING` is unreachable through today's API — every booking is created directly as `CONFIRMED`,
+  since there is no payment or manual-approval gate yet. The state remains fully defined for when
+  one is added.
+- Idempotency keys never expire; there's no cleanup job for old key rows.
+- No payment integration — creating a booking has no cost to the customer in this milestone.

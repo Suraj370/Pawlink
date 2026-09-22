@@ -16,6 +16,8 @@ import { Route as RegisterRouteImport } from './routes/register'
 import { Route as AuthenticatedDashboardRouteImport } from './routes/_authenticated/dashboard'
 import { Route as ProvidersIndexRouteImport } from './routes/providers/index'
 import { Route as ProvidersProviderIdRouteImport } from './routes/providers/$providerId'
+import { Route as AuthenticatedBookingsIndexRouteImport } from './routes/_authenticated/bookings/index'
+import { Route as AuthenticatedBookingsBookingIdRouteImport } from './routes/_authenticated/bookings/$bookingId'
 import { Route as AuthenticatedPetsIndexRouteImport } from './routes/_authenticated/pets/index'
 import { Route as AuthenticatedPetsPetIdRouteImport } from './routes/_authenticated/pets/$petId'
 
@@ -53,6 +55,18 @@ const ProvidersProviderIdRoute = ProvidersProviderIdRouteImport.update({
   path: '/providers/$providerId',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AuthenticatedBookingsIndexRoute =
+  AuthenticatedBookingsIndexRouteImport.update({
+    id: '/bookings/',
+    path: '/bookings/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedBookingsBookingIdRoute =
+  AuthenticatedBookingsBookingIdRouteImport.update({
+    id: '/bookings/$bookingId',
+    path: '/bookings/$bookingId',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
 const AuthenticatedPetsIndexRoute = AuthenticatedPetsIndexRouteImport.update({
   id: '/pets/',
   path: '/pets/',
@@ -71,7 +85,9 @@ export interface FileRoutesByFullPath {
   '/dashboard': typeof AuthenticatedDashboardRoute
   '/providers/$providerId': typeof ProvidersProviderIdRoute
   '/providers/': typeof ProvidersIndexRoute
+  '/bookings/$bookingId': typeof AuthenticatedBookingsBookingIdRoute
   '/pets/$petId': typeof AuthenticatedPetsPetIdRoute
+  '/bookings/': typeof AuthenticatedBookingsIndexRoute
   '/pets/': typeof AuthenticatedPetsIndexRoute
 }
 export interface FileRoutesByTo {
@@ -81,7 +97,9 @@ export interface FileRoutesByTo {
   '/dashboard': typeof AuthenticatedDashboardRoute
   '/providers/$providerId': typeof ProvidersProviderIdRoute
   '/providers': typeof ProvidersIndexRoute
+  '/bookings/$bookingId': typeof AuthenticatedBookingsBookingIdRoute
   '/pets/$petId': typeof AuthenticatedPetsPetIdRoute
+  '/bookings': typeof AuthenticatedBookingsIndexRoute
   '/pets': typeof AuthenticatedPetsIndexRoute
 }
 export interface FileRoutesById {
@@ -93,7 +111,9 @@ export interface FileRoutesById {
   '/_authenticated/dashboard': typeof AuthenticatedDashboardRoute
   '/providers/$providerId': typeof ProvidersProviderIdRoute
   '/providers/': typeof ProvidersIndexRoute
+  '/_authenticated/bookings/$bookingId': typeof AuthenticatedBookingsBookingIdRoute
   '/_authenticated/pets/$petId': typeof AuthenticatedPetsPetIdRoute
+  '/_authenticated/bookings/': typeof AuthenticatedBookingsIndexRoute
   '/_authenticated/pets/': typeof AuthenticatedPetsIndexRoute
 }
 export interface FileRouteTypes {
@@ -105,7 +125,9 @@ export interface FileRouteTypes {
     | '/dashboard'
     | '/providers/$providerId'
     | '/providers/'
+    | '/bookings/$bookingId'
     | '/pets/$petId'
+    | '/bookings/'
     | '/pets/'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -115,7 +137,9 @@ export interface FileRouteTypes {
     | '/dashboard'
     | '/providers/$providerId'
     | '/providers'
+    | '/bookings/$bookingId'
     | '/pets/$petId'
+    | '/bookings'
     | '/pets'
   id:
     | '__root__'
@@ -126,7 +150,9 @@ export interface FileRouteTypes {
     | '/_authenticated/dashboard'
     | '/providers/$providerId'
     | '/providers/'
+    | '/_authenticated/bookings/$bookingId'
     | '/_authenticated/pets/$petId'
+    | '/_authenticated/bookings/'
     | '/_authenticated/pets/'
   fileRoutesById: FileRoutesById
 }
@@ -190,6 +216,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ProvidersProviderIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/_authenticated/bookings/': {
+      id: '/_authenticated/bookings/'
+      path: '/bookings'
+      fullPath: '/bookings/'
+      preLoaderRoute: typeof AuthenticatedBookingsIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/bookings/$bookingId': {
+      id: '/_authenticated/bookings/$bookingId'
+      path: '/bookings/$bookingId'
+      fullPath: '/bookings/$bookingId'
+      preLoaderRoute: typeof AuthenticatedBookingsBookingIdRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
     '/_authenticated/pets/': {
       id: '/_authenticated/pets/'
       path: '/pets'
@@ -209,13 +249,17 @@ declare module '@tanstack/react-router' {
 
 interface AuthenticatedRouteRouteChildren {
   AuthenticatedDashboardRoute: typeof AuthenticatedDashboardRoute
+  AuthenticatedBookingsBookingIdRoute: typeof AuthenticatedBookingsBookingIdRoute
   AuthenticatedPetsPetIdRoute: typeof AuthenticatedPetsPetIdRoute
+  AuthenticatedBookingsIndexRoute: typeof AuthenticatedBookingsIndexRoute
   AuthenticatedPetsIndexRoute: typeof AuthenticatedPetsIndexRoute
 }
 
 const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedDashboardRoute: AuthenticatedDashboardRoute,
+  AuthenticatedBookingsBookingIdRoute: AuthenticatedBookingsBookingIdRoute,
   AuthenticatedPetsPetIdRoute: AuthenticatedPetsPetIdRoute,
+  AuthenticatedBookingsIndexRoute: AuthenticatedBookingsIndexRoute,
   AuthenticatedPetsIndexRoute: AuthenticatedPetsIndexRoute,
 }
 

@@ -77,10 +77,12 @@ test("provider owner sets weekly hours, a second window, a date exception, and s
   await expect(slotButtons.last()).toHaveText("16:00");
   await expect(page.getByTestId("slot-button").filter({ hasText: "16:30" })).toHaveCount(0);
 
-  // Clicking a slot must not create a booking — only demonstrate the
-  // engine works.
+  // Clicking a slot only opens the review step — it must not immediately
+  // create a booking. The full booking workflow is covered by
+  // e2e/bookings.spec.ts; this availability test only proves the engine
+  // itself is wired up correctly.
   await slotButtons.first().click();
-  await expect(page.getByTestId("selected-slot-message")).toContainText("booking isn't available yet");
+  await expect(page.getByTestId("booking-confirm-panel")).toBeVisible();
 
   // The exception date shows no slots at all.
   await picker.getByLabel("Date").fill(exceptionDate);

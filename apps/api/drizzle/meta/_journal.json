@@ -43,6 +43,13 @@
       "when": 1790083243626,
       "tag": "0005_shiny_storm",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790086302968,
+      "tag": "0006_plain_legion",
+      "breakpoints": true
     }
   ]
 }

@@ -1,12 +1,13 @@
 import { Hono, type Context } from "hono";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
-import { availabilityQuerySchema, exceptionInputSchema, weeklyRuleInputSchema } from "@pawlink/shared";
+import { availabilityQuerySchema, BLOCKING_BOOKING_STATUSES, exceptionInputSchema, weeklyRuleInputSchema } from "@pawlink/shared";
 import type { AppEnv } from "../types.js";
 import type { DbClient } from "../db/client.js";
-import { availabilityExceptions, providerAvailability, providers, services } from "../db/schema.js";
+import { availabilityExceptions, bookings, providerAvailability, providers, services } from "../db/schema.js";
 import { calculateAvailableSlots, SLOT_INTERVAL_MINUTES } from "../lib/availability.js";
 import { toPublicException, toPublicWeeklyRule } from "../lib/availability-dto.js";
+import { excludeBookedSlots } from "../lib/booking.js";
 import { createRequireAuth } from "../middleware/auth.js";
 
 const uuidSchema = z.string().uuid();
@@ -98,7 +99,7 @@ export function createAvailabilityRoutes(db: DbClient, nodeEnv: string) {
       where: and(eq(availabilityExceptions.providerId, provider.id), eq(availabilityExceptions.date, date)),
     });
 
-    const slots = calculateAvailableSlots({
+    const candidateSlots = calculateAvailableSlots({
       date,
       timezone: provider.timezone,
       serviceDurationMinutes: service.durationMinutes,
@@ -112,6 +113,20 @@ export function createAvailabilityRoutes(db: DbClient, nodeEnv: string) {
         : null,
       now: new Date(),
     });
+
+    // calculateAvailableSlots is entirely unaware of bookings (it stays a
+    // pure schedule calculation); this is the one place its candidate
+    // output is reconciled against what's actually already reserved —
+    // "availability tells us what could be booked" ends here, before the
+    // response goes out.
+    const activeBookings = await db.query.bookings.findMany({
+      where: and(eq(bookings.providerId, provider.id), inArray(bookings.status, [...BLOCKING_BOOKING_STATUSES])),
+    });
+    const slots = excludeBookedSlots(
+      candidateSlots,
+      service.durationMinutes,
+      activeBookings.map((b) => ({ startAt: b.startAt, endAt: b.endAt })),
+    );
 
     return c.json(
       {

@@ -8,6 +8,7 @@ import {
   integer,
   pgEnum,
   pgTable,
+  primaryKey,
   real,
   serial,
   text,
@@ -18,6 +19,7 @@ import {
   varchar,
 } from "drizzle-orm/pg-core";
 import {
+  BOOKING_STATUS_VALUES,
   DAY_OF_WEEK_VALUES,
   DEFAULT_CURRENCY,
   EXCEPTION_TYPE_VALUES,
@@ -240,5 +242,102 @@ export const availabilityExceptions = pgTable(
       sql`(${table.type} = 'CLOSED' AND ${table.startTime} IS NULL AND ${table.endTime} IS NULL)
           OR (${table.type} = 'CUSTOM_HOURS' AND ${table.startTime} IS NOT NULL AND ${table.endTime} IS NOT NULL AND ${table.endTime} > ${table.startTime})`,
     ),
+  }),
+);
+
+export const bookingStatusEnum = pgEnum("booking_status", BOOKING_STATUS_VALUES);
+
+// Availability tells us what COULD be booked; this table is what actually
+// IS booked — see docs/architecture.md for the full boundary.
+//
+// customer_user_id cascades on user deletion (consistent with every other
+// user-owned row in this schema: pets, providers, sessions). provider_id,
+// service_id, and pet_id are deliberately left at Postgres's default
+// NO ACTION (never CASCADE) — a booking is a historical business record,
+// and none of those three rows may ever be silently deleted out from
+// under one. In practice providers/services are only ever soft-deactivated
+// through the API, never hard-deleted, so this is a safety net; pets,
+// however, ARE hard-deleted through the API (see routes/pets.ts) — that
+// endpoint now catches the resulting FK violation and returns a clean 409
+// instead of letting a raw database error leak through.
+//
+// price_minor/currency/service_name_snapshot/service_duration_minutes_snapshot
+// are captured once, at booking creation time, from the service row as it
+// existed then — never recalculated from the current services row. A
+// provider changing a service's name, price, duration, or active status
+// afterward must never alter what an existing booking represents.
+export const bookings = pgTable(
+  "bookings",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    customerUserId: uuid("customer_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    providerId: uuid("provider_id")
+      .notNull()
+      .references(() => providers.id, { onDelete: "restrict" }),
+    serviceId: uuid("service_id")
+      .notNull()
+      .references(() => services.id, { onDelete: "restrict" }),
+    petId: uuid("pet_id")
+      .notNull()
+      .references(() => pets.id, { onDelete: "restrict" }),
+    startAt: timestamp("start_at", { withTimezone: true }).notNull(),
+    endAt: timestamp("end_at", { withTimezone: true }).notNull(),
+    status: bookingStatusEnum("status").notNull(),
+    priceMinor: integer("price_minor").notNull(),
+    currency: varchar("currency", { length: 3 }).notNull(),
+    serviceNameSnapshot: varchar("service_name_snapshot", { length: 150 }).notNull(),
+    serviceDurationMinutesSnapshot: integer("service_duration_minutes_snapshot").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    customerUserIdIdx: index("bookings_customer_user_id_idx").on(table.customerUserId),
+    providerIdIdx: index("bookings_provider_id_idx").on(table.providerId),
+    providerStatusIdx: index("bookings_provider_status_idx").on(table.providerId, table.status),
+    endAfterStartCheck: check("bookings_end_after_start", sql`${table.endAt} > ${table.startAt}`),
+    priceNonNegativeCheck: check("bookings_price_minor_non_negative", sql`${table.priceMinor} >= 0`),
+    // The actual double-booking prevention — a Postgres EXCLUDE constraint
+    // over (provider_id, tstzrange(start_at, end_at)) for PENDING/
+    // CONFIRMED/COMPLETED rows — cannot be expressed through drizzle-kit's
+    // schema builder at all (no exclusion-constraint API, and this
+    // drizzle-kit version doesn't even emit plain CHECK constraints — see
+    // the services/availability migrations). It's added by hand to the
+    // generated migration, together with `CREATE EXTENSION btree_gist`
+    // which it requires. See drizzle/<migration>.sql and
+    // docs/architecture.md for the full guarantee this provides.
+  }),
+);
+
+// Backs the Idempotency-Key mechanism for POST /api/bookings. Keyed by
+// (customer_user_id, key) — scoped per customer, not global, so one
+// customer can never collide with or observe another's key. request_hash
+// lets a replay of the *same* request return the original booking, while
+// reusing the same key for a *materially different* request is rejected
+// as a conflict rather than silently mutating the original booking's
+// meaning. booking_id starts NULL and is filled in the same transaction
+// that creates the booking — see routes/bookings.ts for why relying on
+// this table's own unique index to serialize concurrent same-key
+// requests (via ordinary Postgres row locking) is what makes "concurrent
+// requests with the same key converge on one booking" correct without
+// any additional application-level locking.
+//
+// No expiry/TTL: a key remains valid to safely retry indefinitely. A
+// time-bounded expiry would need a cleanup job, which is out of scope for
+// this milestone (see docs/architecture.md).
+export const bookingIdempotencyKeys = pgTable(
+  "booking_idempotency_keys",
+  {
+    customerUserId: uuid("customer_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    key: varchar("key", { length: 255 }).notNull(),
+    requestHash: varchar("request_hash", { length: 64 }).notNull(),
+    bookingId: uuid("booking_id").references(() => bookings.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.customerUserId, table.key] }),
   }),
 );
