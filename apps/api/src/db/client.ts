@@ -6,3 +6,5 @@ export function createDb(databaseUrl: string) {
   const pool = new Pool({ connectionString: databaseUrl });
   return drizzle(pool, { schema });
 }
+
+export type DbClient = ReturnType<typeof createDb>;

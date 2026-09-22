@@ -15,6 +15,7 @@
   "dependencies": {
     "@hono/node-server": "^1.13.1",
     "@pawlink/shared": "*",
+    "bcryptjs": "^2.4.3",
     "dotenv": "^16.4.5",
     "drizzle-orm": "^0.33.0",
     "hono": "^4.6.3",
@@ -22,6 +23,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
     "@types/node": "^22.7.4",
     "@types/pg": "^8.11.10",
     "drizzle-kit": "^0.24.2",

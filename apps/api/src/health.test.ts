@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { createApp } from "./app.js";
+import { createTestApp } from "./test-helpers.js";
 
 describe("GET /health", () => {
   it("returns a 200 with an ok status payload", async () => {
-    const app = createApp();
+    const { app } = createTestApp();
     const res = await app.request("/health");
 
     expect(res.status).toBe(200);

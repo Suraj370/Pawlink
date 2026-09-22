@@ -9,6 +9,7 @@
     "packages/*"
   ],
   "scripts": {
+    "postinstall": "npm run build --workspace packages/shared",
     "dev:api": "npm run dev --workspace apps/api",
     "dev:web": "npm run dev --workspace apps/web",
     "build": "npm run build --workspace packages/shared && npm run build --workspace apps/api && npm run build --workspace apps/web",
