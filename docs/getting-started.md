@@ -26,6 +26,7 @@ npm run db:migrate
 | `PORT`          | `3000`                                                 | API listen port.                                                   |
 | `DATABASE_URL`  | `postgres://pawlink:pawlink@localhost:5432/pawlink`    | Must match `docker-compose.yml` credentials for local dev.         |
 | `WEB_ORIGIN`    | `http://localhost:5173`                                | The single origin allowed by CORS; the frontend's dev server URL.  |
+| `MOCK_PAYMENT_WEBHOOK_SECRET` | `dev-mock-payment-webhook-secret`        | Signs/verifies the mock payment provider's webhooks only — not a real payment credential; see [docs/architecture.md](architecture.md). |
 
 `apps/web/.env`:
 

@@ -23,6 +23,7 @@ import {
   DAY_OF_WEEK_VALUES,
   DEFAULT_CURRENCY,
   EXCEPTION_TYPE_VALUES,
+  PAYMENT_STATUS_VALUES,
   PET_SEX_VALUES,
   PROVIDER_STATUS_VALUES,
   PROVIDER_TYPE_VALUES,
@@ -339,5 +340,110 @@ export const bookingIdempotencyKeys = pgTable(
   },
   (table) => ({
     pk: primaryKey({ columns: [table.customerUserId, table.key] }),
+  }),
+);
+
+export const paymentStatusEnum = pgEnum("payment_status", PAYMENT_STATUS_VALUES);
+
+// A booking has 1 --- 0..many payment ATTEMPTS (never overwritten — each
+// row is a historical attempt, matching the same "never mutate history"
+// principle as bookings.service_name_snapshot), but at most one may ever
+// reach SUCCEEDED. That "at most one SUCCEEDED per booking" invariant is
+// enforced by a hand-added PARTIAL UNIQUE INDEX (see the migration —
+// drizzle-kit 0.24.2 has no schema-builder API for partial indexes, same
+// documented gap as CHECK/EXCLUDE elsewhere in this file), not just
+// application logic, so it holds even under a genuine race between two
+// concurrent payment-creation requests.
+//
+// amount_minor/currency are captured once at payment-creation time from
+// the booking's own (already-immutable) snapshot — never trusted from the
+// client, never recalculated later. booking_id is RESTRICT (never
+// CASCADE), matching provider_id/service_id/pet_id on bookings: a payment
+// is a financial record and must never silently vanish because something
+// else was deleted.
+export const payments = pgTable(
+  "payments",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    bookingId: uuid("booking_id")
+      .notNull()
+      .references(() => bookings.id, { onDelete: "restrict" }),
+    // Provider name, e.g. "mock" — the one concrete implementation today.
+    // A real Stripe/Razorpay provider would be a different value here,
+    // with no other schema change required (see lib/payment-provider.ts).
+    provider: varchar("provider", { length: 50 }).notNull(),
+    providerPaymentId: varchar("provider_payment_id", { length: 255 }),
+    amountMinor: integer("amount_minor").notNull(),
+    currency: varchar("currency", { length: 3 }).notNull(),
+    status: paymentStatusEnum("status").notNull().default("CREATED"),
+    failureCode: varchar("failure_code", { length: 100 }),
+    failureMessage: varchar("failure_message", { length: 500 }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    bookingIdIdx: index("payments_booking_id_idx").on(table.bookingId),
+    statusIdx: index("payments_status_idx").on(table.status),
+    // Uniqueness per (provider, provider_payment_id) — two payment rows,
+    // even across different bookings, must never share the same
+    // provider-side identifier. Postgres allows multiple NULLs through a
+    // plain UNIQUE constraint, which is fine here since every payment
+    // created through today's flow receives a providerPaymentId
+    // synchronously from provider.createPayment().
+    providerPaymentIdUnique: unique("payments_provider_provider_payment_id_unique").on(
+      table.provider,
+      table.providerPaymentId,
+    ),
+    amountNonNegativeCheck: check("payments_amount_minor_non_negative", sql`${table.amountMinor} >= 0`),
+    // The "at most one SUCCEEDED payment per booking" partial unique
+    // index is hand-added to the migration SQL — see the comment above
+    // this table and docs/architecture.md, "Duplicate payment
+    // protection."
+  }),
+);
+
+// Mirrors booking_idempotency_keys exactly (same rationale: scoped per
+// customer via a composite primary key so one customer can never collide
+// with or observe another's key; request_hash lets a sequential replay of
+// the SAME request return the original payment while reusing the key for
+// a materially different request — here, a different bookingId, which is
+// the only thing about a payment-creation request that can actually vary,
+// since amount/currency are never client-supplied — is rejected as a
+// conflict). No expiry, same reasoning as booking keys.
+export const paymentIdempotencyKeys = pgTable(
+  "payment_idempotency_keys",
+  {
+    customerUserId: uuid("customer_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    key: varchar("key", { length: 255 }).notNull(),
+    requestHash: varchar("request_hash", { length: 64 }).notNull(),
+    paymentId: uuid("payment_id").references(() => payments.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.customerUserId, table.key] }),
+  }),
+);
+
+// Backs webhook idempotency: (provider, event_id) is UNIQUE, so
+// processing the identical event twice is a plain INSERT ... ON CONFLICT
+// DO NOTHING away from being a safe no-op the second time — the exact
+// same technique booking_idempotency_keys already uses for concurrent
+// same-key booking requests, applied here to concurrent/duplicate webhook
+// deliveries instead. Persisted in Postgres (never an in-memory map), so
+// it survives an API process restart, same as every other idempotency
+// mechanism in this codebase.
+export const paymentWebhookEvents = pgTable(
+  "payment_webhook_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    provider: varchar("provider", { length: 50 }).notNull(),
+    eventId: varchar("event_id", { length: 255 }).notNull(),
+    paymentId: uuid("payment_id").references(() => payments.id, { onDelete: "cascade" }),
+    receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    providerEventUnique: unique("payment_webhook_events_provider_event_id_unique").on(table.provider, table.eventId),
   }),
 );

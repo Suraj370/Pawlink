@@ -14,3 +14,4 @@ export * from "./providers.js";
 export * from "./services.js";
 export * from "./availability.js";
 export * from "./bookings.js";
+export * from "./payments.js";

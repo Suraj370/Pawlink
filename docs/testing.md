@@ -100,13 +100,24 @@ configured schedule), plus a dedicated case confirming an inactive provider/serv
 `SlotPicker` at all.
 
 `e2e/bookings.spec.ts` covers the full customer workflow end to end (register, add a pet, pick a
-service and slot on a real provider another user set up, review, confirm, see the confirmation, find
-it in "My Bookings", then reload availability and confirm the exact slot — and any other slot that
-would now overlap it — no longer appears) and cancellation (cancel from the booking detail page,
-confirm the slot becomes bookable again). `e2e/bookings-security.spec.ts` is the mandatory
-cross-user proof: User B gets "not found" in the UI and a `404` directly against
-`GET/POST /api/bookings/:id`(`/cancel`) for User A's booking, and a `404` attempting to book using
-User A's own pet id.
+service and slot on a real provider another user set up, review, confirm — which creates a `PENDING`
+booking — then pay via the mock provider's "Pay now" button on the payment step, see the payment
+succeed and the booking confirmation appear only after that, find it in "My Bookings", then reload
+availability and confirm the exact slot — and any other slot that would now overlap it — no longer
+appears) and cancellation (cancel from the booking detail page, confirm the slot becomes bookable
+again). `e2e/bookings-security.spec.ts` is the mandatory cross-user proof: User B gets "not found" in
+the UI and a `404` directly against `GET/POST /api/bookings/:id`(`/cancel`) for User A's booking, and
+a `404` attempting to book using User A's own pet id (User A still pays via the mock provider before
+the cross-user assertions run, so the booking under attack is a real, `CONFIRMED` one).
+
+`e2e/payments.spec.ts` covers what `bookings.spec.ts`'s happy path doesn't: a failed mock payment
+(clicking "Simulate: payment fails") leaves the booking `CANCELLED`, never shows the booking
+confirmation screen, and explains clearly that the booking was not confirmed; a `PENDING` mock
+payment (clicking "Simulate: still processing") shows a processing state with a "Check again" reload
+action, never a premature confirmation; and once a booking is genuinely paid, revisiting its detail
+page never renders the payment panel again (the `CONFIRMED` status alone hides it) — proving
+duplicate-payment protection is visible in the UI, not just enforced server-side (the deeper
+concurrent-duplicate guarantee is proven directly against the API, see below).
 
 ### 5. Concurrency and idempotency tests (`apps/api/src/bookings.test.ts`)
 
@@ -117,10 +128,11 @@ genuine race condition to prove correct:
   requests for the exact same provider/slot from two different customers. Asserts exactly one `201`
   and one clean `409` (never two `201`s, never a raw database error surfacing), and then
   independently re-queries the database (via the provider owner's booking list) to confirm exactly
-  one `CONFIRMED` booking actually exists for that appointment — the HTTP responses alone aren't
-  trusted as the proof. The same scenario is also verified with real concurrent `curl` processes
-  against the live dev server (not just Vitest's in-process request calls), confirming the guarantee
-  holds under actual concurrent network requests, not just concurrent JavaScript promises.
+  one `PENDING` booking actually exists for that appointment (bookings start `PENDING`, not
+  `CONFIRMED` — see docs/architecture.md, "Booking confirmation rule") — the HTTP responses alone
+  aren't trusted as the proof. The same scenario is also verified with real concurrent `curl`
+  processes against the live dev server (not just Vitest's in-process request calls), confirming the
+  guarantee holds under actual concurrent network requests, not just concurrent JavaScript promises.
 - **Idempotency tests**: same key + same request replays the original booking (`200`, not a second
   `201`); same key + different request is a `409` conflict; a genuinely concurrent pair of requests
   sharing one key converge on a single booking id; a request with no key at all is never
@@ -140,14 +152,14 @@ genuine race condition to prove correct:
   the provider/service status race," for the `SELECT ... FOR UPDATE` fix and the exact guarantee it
   establishes.
 - **Cancellation race test** (`cancellation race`): fires two concurrent
-  `POST /api/bookings/:id/cancel` requests for the same `CONFIRMED` booking — one from the customer,
+  `POST /api/bookings/:id/cancel` requests for the same booking — one from the customer,
   one from the provider owner. Asserts exactly one `200` and one `409` (never two `200`s), with the
   booking ending in `CANCELLED`. See docs/architecture.md, "Cancellation race," for why the plain
   read-then-write shape needed the same `SELECT ... FOR UPDATE` treatment as booking creation.
 - **10-way concurrency stress test** (`concurrency stress`): strengthens the mandatory double-booking
   race test from 2 to 10 concurrent `POST /api/bookings` requests, from 10 different customers, for
   the exact same provider/service/slot. Asserts exactly one `201` and nine `409`s, and independently
-  re-queries the database for exactly one `CONFIRMED` booking — proving the `EXCLUDE` constraint (and
+  re-queries the database for exactly one `PENDING` booking — proving the `EXCLUDE` constraint (and
   the availability re-check) holds under a wider field, not just a two-way race.
 - **Idempotency hardening tests**: two different customers using the identical key string never
   collide (keys are scoped per `(customer_user_id, key)`); a request that fails application-level
@@ -160,6 +172,42 @@ genuine race condition to prove correct:
   and that the same key is provably unclaimed — confirming the whole transaction (including the
   idempotency claim insert) rolled back atomically, never leaving a booking-less claim or a
   claim-less booking behind.
+
+### 6. Payment tests (`apps/api/src/payments.test.ts`, `apps/api/src/lib/payment.test.ts`, `apps/api/src/lib/payment-provider.test.ts`)
+
+- **Pure unit tests**: `payment.test.ts` exhaustively tests `canTransitionPaymentStatus`/
+  `assertPaymentStatusTransition` for every valid transition and every invalid one (including every
+  self-transition and every out-of-terminal-state transition), mirroring `booking.test.ts`'s own
+  exhaustive style. `payment-provider.test.ts` tests `MockPaymentProvider` in isolation: every
+  scenario (`SUCCESS`/`FAILURE`/`PENDING`) resolves deterministically (never randomly — run 5 times,
+  assert the identical result every time), and `verifyWebhook` correctly separates a signature
+  failure from a payload-shape failure from a valid event, including proving a signature computed
+  with the wrong secret is rejected even though the body itself is well-formed.
+- **Creation tests**: the default scenario (`SUCCESS`) confirms the booking; `FAILURE` cancels it;
+  `PENDING` leaves it `PENDING`; the amount/currency are always the booking's own values regardless of
+  what the client sends; `providerPaymentId` is never exposed in the response; a different customer or
+  the provider owner attempting to pay for someone else's/a customer's booking gets `404`; paying for
+  an already-`CONFIRMED` or `CANCELLED` booking is rejected with `409`; malformed JSON is rejected;
+  retrying while a payment is already `PENDING` returns the SAME payment, not a second one.
+- **Idempotency tests**: same key + same booking replays the original payment (`200`); same key +
+  a different booking is a `409` conflict; a genuinely concurrent pair of requests sharing one key
+  converge on a single payment id. The idempotency pre-check had to be moved BEFORE the payability
+  gate during development — the exact same class of ordering bug booking creation's own idempotency
+  fix caught, in a different endpoint (see docs/architecture.md, "Idempotency," under Payments).
+- **The mandatory concurrency test**: two `Promise.all`-concurrent `POST /api/bookings/:bookingId/payment`
+  requests (no idempotency key) for the same booking. Asserts exactly one `201` and one `409`, and
+  independently re-queries the database for exactly one `SUCCEEDED` payment and a `CONFIRMED` booking.
+- **Webhook tests**: a missing or tampered signature is rejected with `401`; a well-signed but
+  malformed/unparseable body is rejected with `400` (proving these are two genuinely separate checks,
+  by signing the exact garbage body being sent, not a well-formed one); an oversized body (>64 KB) is
+  rejected with `413` before signature verification even runs; an unknown `providerPaymentId` is
+  rejected with `404`; a `PENDING` payment is correctly resolved to `SUCCEEDED` (confirming its
+  booking) by a webhook constructed with the exported `buildMockWebhookRequest` test helper; the
+  identical event delivered 2× and 10×-concurrently produces exactly one applied transition, the rest
+  reported as `duplicate: true`; an out-of-order `payment.pending` event arriving after
+  `payment.succeeded` already committed does not regress the payment (`applied: false`); a success
+  webhook arriving after the booking was independently cancelled leaves the payment `SUCCEEDED` but
+  the booking `CANCELLED` (the documented, intentional no-op — see docs/architecture.md).
 
 ## What "passing" actually means here
 

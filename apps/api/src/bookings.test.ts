@@ -123,7 +123,7 @@ describe("POST /api/bookings — creation", () => {
     });
     expect(res.status).toBe(201);
     const json = (await res.json()) as { booking: Record<string, unknown> };
-    expect(json.booking.status).toBe("CONFIRMED");
+    expect(json.booking.status).toBe("PENDING");
     expect(json.booking.startAt).toBe(new Date(`${monday}T09:00:00+00:00`).toISOString());
     expect(json.booking.endAt).toBe(new Date(`${monday}T10:00:00+00:00`).toISOString());
     expect(json.booking.priceMinor).toBe(79900);
@@ -372,6 +372,7 @@ describe("POST /api/bookings — mass assignment ignored", () => {
         endAt: string;
         serviceName: string;
         serviceDurationMinutes: number;
+        status: string;
       };
     };
     // Server-derived values — from the authoritative service row read
@@ -381,6 +382,10 @@ describe("POST /api/bookings — mass assignment ignored", () => {
     expect(json.booking.serviceName).toBe("Consultation");
     expect(json.booking.serviceDurationMinutes).toBe(60);
     expect(json.booking.endAt).toBe(new Date(`${monday}T10:00:00+00:00`).toISOString());
+    // The injected status: "CONFIRMED" is ignored entirely — a booking
+    // is never created as CONFIRMED; it always starts PENDING and only
+    // becomes CONFIRMED via a successful payment (see routes/payments.ts).
+    expect(json.booking.status).toBe("PENDING");
 
     // Confirm the booking is attributed to the actual authenticated
     // customer, not the injected victim id — it shows up in the real
@@ -466,7 +471,7 @@ describe("historical snapshots survive later service changes", () => {
     const res = await app.request(`/api/bookings/${booking.id}`, { headers: { cookie: customer.cookie } });
     expect(res.status).toBe(200);
     const json = (await res.json()) as { booking: { status: string } };
-    expect(json.booking.status).toBe("CONFIRMED");
+    expect(json.booking.status).toBe("PENDING");
   });
 
   it("prevents deleting a pet that has booking history, with a clean error (not a raw DB error)", async () => {
@@ -634,7 +639,7 @@ describe("POST /api/bookings/:id/cancel", () => {
 
     const verify = await app.request(`/api/bookings/${booking.id}`, { headers: { cookie: customer.cookie } });
     const verifyJson = (await verify.json()) as { booking: { status: string } };
-    expect(verifyJson.booking.status).toBe("CONFIRMED");
+    expect(verifyJson.booking.status).toBe("PENDING");
   });
 
   it("prevents a different provider owner from cancelling the booking", async () => {
@@ -787,7 +792,7 @@ describe("concurrency — the mandatory double-booking race test", () => {
     const list = await app.request(`/api/bookings?providerId=${provider.id}`, { headers: { cookie: owner.cookie } });
     const listJson = (await list.json()) as { bookings: Array<{ startAt: string; status: string }> };
     const matching = listJson.bookings.filter(
-      (b) => b.startAt === new Date(startAt).toISOString() && b.status === "CONFIRMED",
+      (b) => b.startAt === new Date(startAt).toISOString() && b.status === "PENDING",
     );
     expect(matching).toHaveLength(1);
   });
@@ -858,7 +863,7 @@ describe("concurrency — provider deactivated while a booking is being created"
     const list = await app.request(`/api/bookings?providerId=${provider.id}`, { headers: { cookie: owner.cookie } });
     const listJson = (await list.json()) as { bookings: Array<{ startAt: string; status: string }> };
     const matching = listJson.bookings.filter(
-      (b) => b.startAt === new Date(startAt).toISOString() && b.status === "CONFIRMED",
+      (b) => b.startAt === new Date(startAt).toISOString() && b.status === "PENDING",
     );
     expect(matching).toHaveLength(bookingRes.status === 201 ? 1 : 0);
   });
@@ -1051,7 +1056,7 @@ describe("concurrency stress — 10 concurrent attempts for the same slot", () =
     // CONFIRMED booking for this exact appointment.
     const list = await app.request(`/api/bookings?providerId=${provider.id}`, { headers: { cookie: owner.cookie } });
     const listJson = (await list.json()) as { bookings: Array<{ startAt: string; status: string }> };
-    const matching = listJson.bookings.filter((b) => b.startAt === new Date(startAt).toISOString() && b.status === "CONFIRMED");
+    const matching = listJson.bookings.filter((b) => b.startAt === new Date(startAt).toISOString() && b.status === "PENDING");
     expect(matching).toHaveLength(1);
     },
     20_000,
@@ -1099,7 +1104,7 @@ describe("historical booking behavior — provider deactivation after a booking 
     const res = await app.request(`/api/bookings/${booking.id}`, { headers: { cookie: customer.cookie } });
     expect(res.status).toBe(200);
     const json = (await res.json()) as { booking: { status: string } };
-    expect(json.booking.status).toBe("CONFIRMED");
+    expect(json.booking.status).toBe("PENDING");
 
     // But a NEW booking against the now-inactive provider is rejected.
     const pet2 = await createPet(customer.cookie);

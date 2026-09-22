@@ -16,8 +16,12 @@ type Props = {
   onBooked: (booking: PublicBooking) => void
 }
 
-// Clicking a slot only opens this review step — the reservation is made
-// only once the server confirms POST /api/bookings succeeds.
+// Clicking a slot only opens this review step — the slot is only actually
+// held once the server confirms POST /api/bookings succeeds, and even
+// then the booking starts PENDING, not CONFIRMED: it still occupies the
+// provider's calendar (so nobody else can take it), but becomes CONFIRMED
+// only after payment succeeds — see BookingPaymentStep, the next step
+// this panel's onBooked callback hands off to.
 export function BookingConfirmPanel({ providerId, service, slotIso, onCancel, onBooked }: Props) {
   const { data: pets, isLoading: petsLoading } = usePets()
   const [petId, setPetId] = useState("")

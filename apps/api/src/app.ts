@@ -12,9 +12,15 @@ import { createProviderRoutes } from "./routes/providers.js";
 import { createServiceRoutes } from "./routes/services.js";
 import { createAvailabilityRoutes } from "./routes/availability.js";
 import { createBookingRoutes } from "./routes/bookings.js";
+import { createBookingPaymentRoutes, createMockPaymentProvider, createPaymentRoutes } from "./routes/payments.js";
 
 export function createApp(db: DbClient, env: Env) {
   const app = new Hono<AppEnv>();
+  // The one concrete PaymentProvider implementation today. Swapping in a
+  // real provider later (Stripe/Razorpay/etc.) means constructing a
+  // different implementation of the SAME PaymentProvider interface here
+  // — routes/payments.ts never changes. See lib/payment-provider.ts.
+  const paymentProvider = createMockPaymentProvider(env.MOCK_PAYMENT_WEBHOOK_SECRET);
 
   app.use("*", logger());
   app.use(
@@ -40,6 +46,8 @@ export function createApp(db: DbClient, env: Env) {
   app.route("/api/providers/:providerId/services", createServiceRoutes(db, env.NODE_ENV));
   app.route("/api/providers/:providerId/availability", createAvailabilityRoutes(db, env.NODE_ENV));
   app.route("/api/bookings", createBookingRoutes(db, env.NODE_ENV));
+  app.route("/api/bookings/:bookingId/payment", createBookingPaymentRoutes(db, env.NODE_ENV, paymentProvider));
+  app.route("/api/payments", createPaymentRoutes(db, env.NODE_ENV, paymentProvider));
 
   app.notFound((c) => {
     return c.json({ error: "Not Found" }, 404);

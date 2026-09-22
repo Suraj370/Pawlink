@@ -4,6 +4,7 @@ import { Link, createFileRoute } from "@tanstack/react-router"
 import { Button } from "@/components/ui/button"
 import { toErrorMessage } from "@/lib/api/errors"
 import { useBooking, useCancelBooking } from "@/features/bookings/hooks"
+import { PaymentPanel } from "@/features/payments/components/PaymentPanel"
 import { priceMinorToMajor } from "@/features/services/money"
 
 export const Route = createFileRoute("/_authenticated/bookings/$bookingId")({
@@ -77,6 +78,9 @@ function BookingDetailsPage() {
           {booking.currency} {priceMinorToMajor(booking.priceMinor)}
         </dd>
       </dl>
+      {booking.status === "PENDING" && (
+        <PaymentPanel bookingId={booking.id} amountMinor={booking.priceMinor} currency={booking.currency} />
+      )}
       {cancelError && (
         <p role="alert" className="text-sm text-destructive">
           {cancelError}

@@ -50,6 +50,13 @@
       "when": 1790086302968,
       "tag": "0006_plain_legion",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1790094680574,
+      "tag": "0007_smart_anita_blake",
+      "breakpoints": true
     }
   ]
 }

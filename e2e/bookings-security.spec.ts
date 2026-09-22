@@ -84,6 +84,12 @@ test("a booking made by one customer cannot be viewed or cancelled by another cu
     const confirmPanel = pageA.getByTestId("booking-confirm-panel");
     await confirmPanel.getByLabel("Pet").selectOption({ label: "PetA" });
     await confirmPanel.getByRole("button", { name: "Confirm Booking" }).click();
+
+    const paymentPanel = pageA.getByTestId("payment-panel");
+    await expect(paymentPanel).toBeVisible();
+    await paymentPanel.getByTestId("pay-success-button").click();
+    await expect(paymentPanel.getByTestId("payment-status-succeeded")).toBeVisible();
+
     await expect(pageA.getByTestId("booking-confirmation")).toBeVisible();
 
     await pageA.getByRole("link", { name: "View my bookings" }).click();

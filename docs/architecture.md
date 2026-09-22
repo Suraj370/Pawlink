@@ -228,14 +228,16 @@ CANCELLED, COMPLETED: terminal — no transitions out.
 
 Enforced by a single authoritative function, `assertBookingStatusTransition`
 (`apps/api/src/lib/booking.ts`), not scattered ad hoc status checks. Every booking created through
-today's API goes directly to `CONFIRMED` — there is no payment or manual-provider-approval gate yet
-that would justify holding it in `PENDING` first — but `PENDING` remains a fully legal, tested state
-in the schema and transition table rather than a stub, since it's the natural hook for a future
-payment-hold or manual-confirmation flow. `COMPLETED` is a legal transition target with no endpoint
-that currently produces it (no "mark completed" action or automatic post-appointment job exists —
-deliberately out of scope for this milestone, see Known limitations below). Cancellation
+today's API starts `PENDING` — see **Payments**, below, for the full explanation: a booking becomes
+`CONFIRMED` only once its payment succeeds, never at creation time. `PENDING` already occupies the
+provider's calendar (see `BLOCKING_BOOKING_STATUSES` below), so the double-booking guarantee holds
+identically whether or not payment has completed yet. `COMPLETED` is a legal transition target with
+no endpoint that currently produces it (no "mark completed" action or automatic post-appointment job
+exists — deliberately out of scope for this milestone, see Known limitations below). Cancellation
 (`POST /api/bookings/:id/cancel`) only ever changes `status`; the row is never deleted, because a
-booking is a historical business record.
+booking is a historical business record. A `PENDING` booking can be cancelled directly by the
+customer (before ever paying) through this same endpoint — no special-casing needed, since
+`PENDING -> CANCELLED` was already a legal transition before payments existed.
 
 Which statuses occupy a provider's calendar (`BLOCKING_BOOKING_STATUSES`,
 `packages/shared/src/bookings.ts`) is `PENDING`, `CONFIRMED`, and `COMPLETED` — `CANCELLED` never
@@ -437,13 +439,252 @@ id.
 | Service is deactivated after a booking exists | Existing booking remains valid and viewable; only *new* bookings against it are blocked |
 | A pet has existing booking history | `DELETE /api/pets/:id` is rejected (`409`) rather than leaving a booking pointing at a vanished pet — `bookings.pet_id`/`provider_id`/`service_id` are `RESTRICT` foreign keys, never `CASCADE`, and the pets route now catches that FK violation and returns a clean error instead of a raw `500` |
 
+## Payments
+
+### The central rule: a payment success is processed by the server; the browser never directly changes a booking to CONFIRMED
+
+> A payment success is processed by the server. The browser never directly changes a booking to
+> `CONFIRMED`.
+
+Every code path that moves a booking to `CONFIRMED` — the synchronous mock-payment-creation path and
+the asynchronous webhook path — lives entirely in `apps/api/src/routes/payments.ts`, inside a
+database transaction, driven by the payment outcome the **server** (or, in a real integration, the
+provider's signed webhook) observed. No frontend code ever calls anything that sets a booking's
+status directly; the React Query cache is only ever populated by refetching the booking from the
+API after a mutation, and `PaymentPanel`/`BookingPaymentStep` (`apps/web/src/features/...`) render
+whatever status comes back — including staying on a `PENDING` screen indefinitely if that's what the
+server still reports.
+
+### Payment state machine
+
+```text
+CREATED   -> PENDING | SUCCEEDED | FAILED
+PENDING   -> SUCCEEDED | FAILED | CANCELLED
+SUCCEEDED, FAILED, CANCELLED: terminal — no transitions out.
+```
+
+Enforced by a single authoritative function, `canTransitionPaymentStatus`/`assertPaymentStatusTransition`
+(`apps/api/src/lib/payment.ts`), mirroring `assertBookingStatusTransition`'s exact design: no
+self-transitions (`X -> X`) are legal. `CREATED` exists as a distinct instant from `PENDING` so a
+future real provider whose `createPayment` call can itself fail partway (network error, provider
+`5xx`) has somewhere to leave the record — but the mock provider always responds synchronously, so in
+practice every payment reaches `PENDING`, `SUCCEEDED`, or `FAILED` within the same request that
+created it; `CREATED` is never observed as a resting state through today's API. A duplicate
+`payment.succeeded` webhook for an already-`SUCCEEDED` payment is rejected by this same table
+(`SUCCEEDED -> SUCCEEDED` isn't a legal transition) — but that rejection is never surfaced as an
+error; see **Webhook idempotency and out-of-order events**, below.
+
+### Booking/payment relationship: one booking, many payment attempts, at most one success
+
+```text
+booking 1 ─── 0..many payment ATTEMPTS
+                       (at most one may ever reach SUCCEEDED)
+```
+
+A booking is never limited to a single payment row. A `FAILED` attempt (or a `CREATED` row from a
+provider call that itself failed, for a future real provider) stays in the table as a historical
+record — the same "never mutate/erase history" principle as `bookings.service_name_snapshot` — so a
+retried payment after a failure is a **new row**, not an overwrite of the old one. What's actually
+enforced, at the database level, is narrower and more important: **at most one payment for a given
+booking may ever be `SUCCEEDED`**. This is a hand-added **partial unique index**
+(`payments_one_succeeded_per_booking`, `WHERE status = 'SUCCEEDED'` — see the migration; drizzle-kit
+0.24.2 has no schema-builder API for partial indexes, the same category of gap as the booking
+engine's `EXCLUDE` constraint) rather than a plain `UNIQUE(booking_id)`, which would have wrongly
+also forbidden ever recording a second `FAILED` attempt.
+
+In practice, this milestone's lifecycle design (payment failure immediately cancels the booking — see
+below) means a booking can only ever actually reach a second payment ATTEMPT in the narrow window
+where the first attempt is still `PENDING` (the mock provider's deterministic "still processing"
+scenario) — and that case is handled by returning the existing in-flight attempt rather than creating
+a concurrent second one (see **Duplicate payment protection**, below). The partial index is the real,
+database-level backstop regardless of what the application layer's read-then-decide logic concludes.
+
+### Amount integrity
+
+The client can request a payment attempt, but never states what it costs. `POST
+/api/bookings/:bookingId/payment` accepts only an optional `scenario` field (mock-only, see below) —
+no `amountMinor`, `currency`, `bookingId`-in-body, or `customerUserId`. The amount is always derived
+inside the same transaction that locks the booking:
+
+```text
+payment.amount_minor = booking.price_minor
+payment.currency     = booking.currency
+```
+
+— read from the booking row `SELECT ... FOR UPDATE`-locked at the start of that transaction, exactly
+the same authoritative-read pattern the booking engine itself uses (see **Transaction boundaries**,
+above). A client submitting `{"amountMinor": 1}` alongside a ₹799 booking is simply ignored; the
+payment is still created for `79900`. Verified directly by test (`apps/api/src/payments.test.ts`,
+"derives amount/currency from the booking, ignoring any client-supplied values").
+
+### The provider abstraction and the mock provider
+
+```text
+Booking/Payment domain
+        ↓
+PaymentProvider interface     (apps/api/src/lib/payment-provider.ts)
+        ↓
+MockPaymentProvider            (the one concrete implementation today)
+```
+
+`routes/payments.ts` calls only three methods — `createPayment`, `getPayment`, `verifyWebhook` — and
+never anything mock-specific. A future real provider (Stripe/Razorpay/etc.) is a second
+implementation of the same interface, swapped in at the composition root (`app.ts`); no change to the
+booking/payment domain logic would be needed. **No real payment gateway, real credentials, or real
+money transfer exists anywhere in this codebase** — `MockPaymentProvider` is a deterministic,
+stateless, local development/test double, clearly labeled as such in its own doc comment and in the
+UI (`PaymentPanel` renders a visible "Mock provider — development only" badge).
+
+`MockPaymentProvider` is deterministic by construction, not just by convention: the provider-side
+payment id it returns *encodes* the scenario it was created with
+(`mock_<scenario>_<ourPaymentId>`), so `getPayment` can report a consistent status purely by decoding
+the id it's given — there is no random number anywhere in the class, and no internal state that
+wouldn't trivially survive a process restart (there's nothing mutable to lose). The one input this
+milestone's mock accepts that a real provider never would is `scenario` (`SUCCESS` | `FAILURE` |
+`PENDING`) on the payment-creation request — purely so tests and the UI's demo buttons can choose a
+deterministic outcome instead of relying on randomness, and it defaults to `SUCCESS` when omitted.
+
+### Booking confirmation rule
+
+```text
+Booking created -> PENDING
+       ↓
+  payment succeeds
+       ↓
+     CONFIRMED
+```
+
+```text
+     PENDING
+       ↓
+  payment fails / is rejected
+       ↓
+    CANCELLED
+```
+
+Both transitions happen inside the exact same transactional helper, `applyBookingSideEffect`
+(`routes/payments.ts`), called identically from the synchronous payment-creation path (the mock
+provider resolving `SUCCESS`/`FAILURE` immediately) and the webhook path — expressed once, not
+duplicated per call site. The booking row is `SELECT ... FOR UPDATE`-locked before either transition
+is attempted, and the transition itself goes through `assertBookingStatusTransition` — so a booking
+that was independently cancelled (e.g. the customer cancelled it directly while payment was still
+`PENDING`) cannot be silently forced back to `CONFIRMED` by a late-arriving success: the transition
+`CANCELLED -> CONFIRMED` isn't legal, `assertBookingStatusTransition` throws
+`BookingStatusTransitionError`, and `applyBookingSideEffect` treats that as a deliberate, documented
+no-op — the **payment** still genuinely records `SUCCEEDED` (a real system would trigger a refund
+here; refunds are explicitly out of scope for this milestone, see Known limitations), but the booking
+is not forced out of its already-resolved state. Verified directly
+(`apps/api/src/payments.test.ts`, "a success webhook arriving after the booking was independently
+cancelled leaves the booking cancelled").
+
+### Duplicate payment protection
+
+Before creating a new payment attempt, the transaction checks for an existing one on that booking: if
+it's already `SUCCEEDED`, that payment is returned as-is (never a new one); if it's still `PENDING`
+(the mock's "still processing" scenario), that same in-flight attempt is returned rather than
+starting a second concurrent one. Combined with the payability gate (a booking must be `PENDING` to
+accept a new payment at all — `CANCELLED`/`CONFIRMED`/`COMPLETED` are all rejected with `409`), this
+means a customer can never end up with two `SUCCEEDED` payments for the same booking, and the
+database's partial unique index (see above) is the final backstop even if the application-level check
+were ever bypassed by a bug.
+
+### Idempotency
+
+`POST /api/bookings/:bookingId/payment` accepts the same `Idempotency-Key` header mechanism as
+booking creation, backed by a `payment_idempotency_keys` table that's structurally identical to
+`booking_idempotency_keys` — scoped per customer via a composite primary key
+`(customer_user_id, key)`, with a `request_hash` (here, just a hash of `bookingId`, since amount and
+currency can never differ for a fixed booking) distinguishing a safe replay from reuse of the same
+key for a materially different request. The idempotency pre-check is deliberately positioned
+**before** the payability gate — a legitimate replay of a request that already succeeded (and thus
+already moved the booking to `CONFIRMED`) must still return the original payment, not be rejected by
+a payability check that only makes sense for a genuinely new attempt. This is the exact same ordering
+fix booking creation itself needed for its own idempotency-vs-availability check (see **Idempotency**
+under Booking engine, above) — the same class of bug, caught the same way, in a different endpoint.
+Persisted in Postgres, never an in-memory map, so it survives an API process restart like every other
+idempotency mechanism in this codebase.
+
+### Webhook verification
+
+`POST /api/payments/webhook` is deliberately **not** behind session authentication — a real payment
+provider is not an authenticated PawLink user and cannot present a session cookie. Authenticity is
+established entirely by a signature: the mock provider computes an HMAC-SHA256 of the raw request
+body using a shared secret (`MOCK_PAYMENT_WEBHOOK_SECRET`, defaulted for local dev, clearly documented
+as a mock-only value and never a real payment-processor credential), sent in an `X-Mock-Signature`
+header. A missing or mismatched signature is rejected with `401` before the body is even parsed as
+JSON — a real provider's webhook secret would be verified exactly this way, just with a real
+provider's signing scheme instead. A well-signed but structurally invalid or unparseable body is
+rejected with `400` — these are two genuinely different failure modes (a security problem vs. a data
+problem), and the code deliberately checks the signature strictly before ever attempting to parse the
+payload, so an attacker can't use a malformed body to skip authentication. Oversized webhook bodies
+(over 64&nbsp;KB) are rejected with `413` before either check runs.
+
+### Webhook idempotency and out-of-order events
+
+Webhook delivery is commonly repeated by real providers (at-least-once delivery), so the exact same
+event must be safe to process any number of times. `payment_webhook_events` is unique on
+`(provider, event_id)`; processing is `INSERT ... ON CONFLICT DO NOTHING` against that constraint —
+the identical technique `booking_idempotency_keys` already relies on for concurrent same-key booking
+requests, applied here to concurrent or simply repeated webhook deliveries. If the insert doesn't
+claim the row, the event has already been processed: the handler returns `200` immediately with no
+further action, not an error (a webhook responder returning a non-2xx just causes a well-behaved
+provider to retry pointlessly). Verified with a genuinely concurrent 10-way `Promise.all` of the
+identical event, asserting exactly one `applied: true` result.
+
+Out-of-order events are **not** handled by any separate "is this out of order?" check — they go
+through the exact same `canTransitionPaymentStatus` table every other transition does. A
+`payment.pending` event arriving after a `payment.succeeded` one already committed simply fails
+`SUCCEEDED -> PENDING` (not a legal transition) and is treated as a safe no-op, identically to how a
+duplicate event with a *different* event id (so it isn't caught by the event-id uniqueness check) but
+the *same* already-applied status would also fail `SUCCEEDED -> SUCCEEDED` (no self-transitions). One
+transition table is the single place "can this event apply right now?" is decided — there is no
+scattered, ad hoc ordering logic anywhere in this codebase.
+
+### Payment failure behavior
+
+A `FAILED` payment (or a `payment.failed` webhook) transitions its booking `PENDING -> CANCELLED` in
+the same transaction — a customer cannot retry paying for that exact booking afterward (it's no
+longer `PENDING`, so the payability gate rejects a new attempt with `409`); they would need to create
+a new booking. The frontend surfaces this plainly: `PaymentPanel` shows "Payment failed" with the
+provider's failure message and explicitly states the booking was not confirmed, never a success
+screen. No refund flow exists or is implied — see Known limitations.
+
+### Authorization
+
+Only the booking's own customer may initiate or view a payment for it — the same IDOR-hiding
+convention as everywhere else (a booking that exists but belongs to someone else, or doesn't exist at
+all, both return the same `404`, never `403`). Provider owners initiating payment on a customer's
+behalf is explicitly **not** supported in this milestone (the milestone spec calls this out
+directly) — a provider owner attempting `POST /api/bookings/:bookingId/payment` for a booking on
+their own provider gets the same `404` a stranger would. `GET /api/payments/:id` (payment detail) is
+readable by the payment's own customer, the owning provider's owner, or an admin, mirroring
+`GET /api/bookings/:id` exactly.
+
+### Response shape
+
+```json
+{ "id": "...", "bookingId": "...", "amountMinor": 79900, "currency": "INR", "status": "SUCCEEDED" }
+```
+
+`providerPaymentId` is deliberately never exposed in the public API shape (`toPublicPayment`,
+`apps/api/src/lib/payment.ts`) — it's an implementation-specific identifier a future real provider's
+id format shouldn't leak into, and the customer has no use for it. Signatures, webhook secrets, and
+raw webhook payloads are never returned by any endpoint.
+
 ### Known limitations
 
 - No endpoint or job currently transitions a booking to `COMPLETED` — it's a legal state in the
   transition table, but nothing produces it yet (would be an automatic post-appointment-time job or
   a provider "mark complete" action; deliberately out of scope here).
-- `PENDING` is unreachable through today's API — every booking is created directly as `CONFIRMED`,
-  since there is no payment or manual-approval gate yet. The state remains fully defined for when
-  one is added.
-- Idempotency keys never expire; there's no cleanup job for old key rows.
-- No payment integration — creating a booking has no cost to the customer in this milestone.
+- Idempotency keys (both booking and payment) never expire; there's no cleanup job for old key rows.
+- **No refunds, payouts, subscriptions, wallets, commissions, taxes, coupons, invoices, or accounting**
+  — explicitly out of scope for this milestone. A payment that succeeds after its booking was
+  independently cancelled (see **Booking confirmation rule**, above) is the one scenario where a real
+  system would need a refund; today it's simply left as a `SUCCEEDED` payment against a `CANCELLED`
+  booking, flagged here for whenever a refund milestone exists.
+- No real payment provider is integrated — `MockPaymentProvider` is the only implementation, and no
+  real payment credentials exist anywhere in this codebase.
+- A `PENDING` mock payment has no background job that ever resolves it on its own; resolution only
+  happens via an explicit webhook delivery (exercised by tests and, for the mock provider's own
+  deterministic model, would be the equivalent of a real provider's async confirmation). The frontend
+  reflects this honestly with a "Check again" reload action rather than pretending to resolve it.

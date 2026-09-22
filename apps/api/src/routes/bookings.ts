@@ -240,7 +240,13 @@ export function createBookingRoutes(db: DbClient, nodeEnv: string) {
             petId: pet.id,
             startAt: requestedInstant,
             endAt,
-            status: "CONFIRMED",
+            // A booking is CONFIRMED only once its payment succeeds (see
+            // routes/payments.ts and docs/architecture.md, "Payment
+            // state machine") — never at creation. PENDING already
+            // occupies the provider's calendar (BLOCKING_BOOKING_STATUSES
+            // includes PENDING), so this still fully protects against
+            // double-booking while payment is in flight.
+            status: "PENDING",
             priceMinor: service.priceMinor,
             currency: service.currency,
             serviceNameSnapshot: service.name,

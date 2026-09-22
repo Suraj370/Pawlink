@@ -3,7 +3,8 @@
 A multi-sided pet-care platform connecting pet parents, vets, groomers, boarding providers, and
 platform administrators. This repository currently implements the project foundation,
 authentication, pet management, provider management, service management, availability management,
-and the booking engine — no other business features are implemented yet.
+the booking engine, and a payment abstraction with a deterministic mock provider — no other business
+features are implemented yet.
 
 ## Stack
 
@@ -36,10 +37,10 @@ Full setup details, environment variables, and prerequisites live in
 
 ```text
 apps/
-  api/      Hono API service (health check, auth, pets, providers, services, availability, bookings)
+  api/      Hono API service (health check, auth, pets, providers, services, availability, bookings, payments)
   web/      React/Vite frontend (TanStack Router/Query, Ky, shadcn/Tailwind UI)
 packages/
-  shared/   Shared types & Zod schemas (health, auth, pets, providers, services, availability, bookings)
+  shared/   Shared types & Zod schemas (health, auth, pets, providers, services, availability, bookings, payments)
 e2e/        Playwright end-to-end tests
 docs/       Project documentation
 ```
@@ -62,6 +63,7 @@ and what each layer of the test suite covers.
 |                | `GET/POST /api/providers/:providerId/availability/rules[/:ruleId]` (+ `PATCH`/`DELETE`)         | owner/admin |
 |                | `GET/POST /api/providers/:providerId/availability/exceptions[/:exceptionId]` (+ `PATCH`/`DELETE`) | owner/admin |
 | Bookings       | `POST/GET /api/bookings`, `GET /api/bookings/:id`, `POST /api/bookings/:id/cancel`               | authenticated |
+| Payments       | `POST/GET /api/bookings/:bookingId/payment`, `GET /api/payments/:id`, `POST /api/payments/webhook` | authenticated (webhook: signature-verified, not session) |
 
 Every mutating endpoint derives ownership from the authenticated session, never from a
 client-supplied id. Full request/response shapes and the authorization model are documented in
@@ -99,12 +101,24 @@ client-supplied id. Full request/response shapes and the authorization model are
   immutable snapshot). Two customers can never successfully reserve the same overlapping
   appointment: a Postgres `EXCLUDE` constraint makes that impossible at the database level, not just
   in application code, verified under real concurrent requests. Duplicate submissions are protected
-  by a persistent `Idempotency-Key` mechanism. Bookings are never hard-deleted — cancellation is a
+  by a persistent `Idempotency-Key` mechanism. A booking starts `PENDING` and is never hard-deleted —
+  it becomes `CONFIRMED` only once payment succeeds (see Payments, below), and cancellation is a
   status transition, governed by an explicit state machine. See
   [docs/architecture.md](docs/architecture.md) for the full design.
+- **Payments**: `POST /api/bookings/:bookingId/payment` charges a `PENDING` booking through a
+  provider-agnostic `PaymentProvider` abstraction (`apps/api/src/lib/payment-provider.ts`) — a
+  deterministic **mock provider** today, swappable for a real one (Stripe/Razorpay/etc.) later
+  without changing the booking/payment domain logic. The amount is always derived server-side from
+  the booking, never the client. A booking becomes `CONFIRMED` only once its payment succeeds
+  (`PENDING -> FAILED` cancels it instead) — the browser never sets a booking to `CONFIRMED` directly.
+  `POST /api/payments/webhook` processes signed provider events with full webhook idempotency
+  (`(provider, event_id)` uniqueness) and correct out-of-order-event handling, all through the same
+  authoritative payment/booking state-transition tables. No real payment gateway, credentials, or
+  money transfer exists anywhere in this codebase — see [docs/architecture.md](docs/architecture.md),
+  "Payments," for the full design, including the exact consistency guarantees.
 
-Other product features (payments, medical records, notifications, AI) are not implemented yet and
-are separate milestones.
+Other product features (refunds, payouts, subscriptions, wallets, medical records, notifications, AI)
+are not implemented yet and are separate milestones.
 
 ## Testing
 

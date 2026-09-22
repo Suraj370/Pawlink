@@ -3,6 +3,7 @@ import { Link } from "@tanstack/react-router"
 import { Button } from "@/components/ui/button"
 import { useProviderServices } from "@/features/services/hooks"
 import { BookingConfirmPanel } from "@/features/bookings/components/BookingConfirmPanel"
+import { BookingPaymentStep } from "@/features/bookings/components/BookingPaymentStep"
 import type { PublicBooking } from "@/features/bookings/schemas"
 import { useAvailability } from "../hooks"
 
@@ -17,6 +18,12 @@ export function SlotPicker({ providerId }: { providerId: string }) {
   const [serviceId, setServiceId] = useState("")
   const [date, setDate] = useState(todayIsoDate())
   const [selectedSlot, setSelectedSlot] = useState<string | null>(null)
+  // A booking exists (holding the slot) as soon as BookingConfirmPanel's
+  // onBooked fires, but it's still only PENDING at that point —
+  // confirmedBooking is set later, only once BookingPaymentStep observes
+  // the SERVER has actually moved it to CONFIRMED after a successful
+  // payment.
+  const [pendingBookingId, setPendingBookingId] = useState<string | null>(null)
   const [confirmedBooking, setConfirmedBooking] = useState<PublicBooking | null>(null)
 
   const enabled = serviceId !== "" && date !== ""
@@ -29,6 +36,7 @@ export function SlotPicker({ providerId }: { providerId: string }) {
 
   function resetSelection() {
     setSelectedSlot(null)
+    setPendingBookingId(null)
     setConfirmedBooking(null)
   }
 
@@ -75,7 +83,7 @@ export function SlotPicker({ providerId }: { providerId: string }) {
           No available slots for this date.
         </p>
       )}
-      {enabled && data && data.slots.length > 0 && !confirmedBooking && (
+      {enabled && data && data.slots.length > 0 && !pendingBookingId && !confirmedBooking && (
         <ul className="flex flex-wrap gap-2" data-testid="slots-list">
           {data.slots.map((slot) => (
             <li key={slot}>
@@ -92,14 +100,18 @@ export function SlotPicker({ providerId }: { providerId: string }) {
         </ul>
       )}
 
-      {selectedSlot && selectedService && !confirmedBooking && (
+      {selectedSlot && selectedService && !pendingBookingId && !confirmedBooking && (
         <BookingConfirmPanel
           providerId={providerId}
           service={selectedService}
           slotIso={selectedSlot}
           onCancel={() => setSelectedSlot(null)}
-          onBooked={(booking) => setConfirmedBooking(booking)}
+          onBooked={(booking) => setPendingBookingId(booking.id)}
         />
+      )}
+
+      {pendingBookingId && !confirmedBooking && (
+        <BookingPaymentStep bookingId={pendingBookingId} onConfirmed={(booking) => setConfirmedBooking(booking)} />
       )}
 
       {confirmedBooking && (
