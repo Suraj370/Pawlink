@@ -8,6 +8,7 @@ import { availabilityExceptions, bookingIdempotencyKeys, bookings, pets, provide
 import { calculateAvailableSlots } from "../lib/availability.js";
 import {
   assertBookingStatusTransition,
+  BookingRouteError,
   BookingStatusTransitionError,
   excludeBookedSlots,
   hashBookingRequest,
@@ -42,10 +43,39 @@ export function createBookingRoutes(db: DbClient, nodeEnv: string) {
   }
 
   // -----------------------------------------------------------------------
-  // POST / — create a booking. Availability is only ever advisory; every
-  // check the availability endpoint makes is re-verified here, server-side,
-  // against the live database, inside the same transaction that performs
-  // the reservation.
+  // POST / — create a booking.
+  //
+  // Core invariant: a booking is created only if the provider, service,
+  // pet, requested time, availability rules, and booking conflicts are ALL
+  // valid at the authoritative point of reservation. The frontend is never
+  // authoritative. A previous availability response is never authoritative.
+  // A read taken outside this transaction is never authoritative — only
+  // the reads and checks performed here, inside this transaction, are.
+  //
+  // Concretely: BEGIN -> authoritative reads (provider/service locked with
+  // SELECT ... FOR UPDATE, pet, weekly rules, exceptions, active bookings)
+  // -> authoritative validation (status/active/availability/conflict) ->
+  // derive booking values from the FRESH rows just read -> insert -> rely
+  // on database constraints (the EXCLUDE constraint, idempotency-key
+  // uniqueness) -> COMMIT. Nothing computed or read before BEGIN is reused
+  // for validation or for the values written to the bookings row.
+  //
+  // The provider and service rows are locked with FOR UPDATE because they
+  // carry mutable state (provider.status, service.active) that a
+  // concurrent request (e.g. the owner deactivating the provider) could
+  // change between an unlocked read and this transaction's COMMIT. Locking
+  // them here means a concurrent status-changing UPDATE on that exact row
+  // blocks until this transaction finishes, and vice versa — whichever
+  // transaction's BEGIN reaches the row first is the one the other
+  // serializes behind, so the two can never observe or write inconsistent
+  // state. See docs/architecture.md, "Provider/service status race", for
+  // the exact guarantee this establishes and why it's the correct choice
+  // over locking every request against every provider unconditionally
+  // (it isn't — only requests that touch the SAME provider/service row
+  // ever contend). The pet row is re-read here too (for a fresh ownership
+  // check) but doesn't need FOR UPDATE: pets have no status field to go
+  // stale, and the RESTRICT foreign key already prevents a dangling
+  // reference from silently producing bad data.
   // -----------------------------------------------------------------------
   app.post("/", async (c) => {
     const user = c.get("user");
@@ -62,102 +92,105 @@ export function createBookingRoutes(db: DbClient, nodeEnv: string) {
     }
     const { providerId, serviceId, petId, startAt } = parsed.data;
     const idempotencyKey = c.req.header("Idempotency-Key");
-
-    const provider = await db.query.providers.findFirst({ where: eq(providers.id, providerId) });
-    if (!provider) return c.json(PROVIDER_NOT_FOUND, 404);
-    if (provider.status !== "ACTIVE") {
-      return c.json({ error: "This provider is not currently accepting bookings" }, 409);
-    }
-
-    const service = await db.query.services.findFirst({
-      where: and(eq(services.id, serviceId), eq(services.providerId, providerId)),
-    });
-    if (!service) return c.json(SERVICE_NOT_FOUND, 404);
-    if (!service.active) {
-      return c.json({ error: "This service is no longer available" }, 409);
-    }
-
-    // Ownership is derived from the session, never a client-supplied
-    // customerUserId — createBookingSchema has no such field. A pet that
-    // exists but belongs to someone else returns the same 404 as a
-    // nonexistent one (the established IDOR-hiding convention).
-    const pet = await db.query.pets.findFirst({ where: eq(pets.id, petId) });
-    if (!pet || pet.ownerId !== user.id) {
-      return c.json(PET_NOT_FOUND, 404);
-    }
-
     const requestedInstant = new Date(startAt);
     const requestHash = idempotencyKey ? hashBookingRequest(parsed.data) : null;
 
-    // Idempotency is checked BEFORE availability re-validation, not after
-    // — a legitimate replay of a request that already succeeded would
-    // otherwise be rejected by the availability check below, since the
-    // booking IT created is now (correctly) occupying that exact slot.
-    // This is a plain read, not yet the transactional claim: a genuinely
-    // concurrent duplicate can still slip past it, which is fine, because
-    // the transactional insert-with-onConflictDoNothing further down
-    // remains the actual source of truth for concurrent-same-key
-    // convergence (see the "concurrent requests" test) — this is purely
-    // what makes a *sequential* replay correct.
-    if (idempotencyKey) {
-      const existingClaim = await db.query.bookingIdempotencyKeys.findFirst({
-        where: and(eq(bookingIdempotencyKeys.customerUserId, user.id), eq(bookingIdempotencyKeys.key, idempotencyKey)),
-      });
-      if (existingClaim && existingClaim.bookingId !== null) {
-        if (existingClaim.requestHash !== requestHash) {
-          return c.json({ error: "Idempotency-Key was already used with different booking parameters" }, 409);
-        }
-        const existingBooking = await db.query.bookings.findFirst({ where: eq(bookings.id, existingClaim.bookingId) });
-        if (existingBooking) {
-          return c.json({ booking: toPublicBooking(existingBooking) }, 200);
-        }
-      }
-    }
-
-    // Re-validate the requested instant against the SAME algorithm the
-    // public availability endpoint uses — not a second implementation of
-    // "what's a legal slot." This alone enforces slot-interval alignment,
-    // full-duration-fits-in-window, exception precedence, and
-    // not-in-the-past, all in one reused call.
-    const candidateDate = zonedDateString(requestedInstant, provider.timezone);
-    const weeklyRules = await db.query.providerAvailability.findMany({
-      where: eq(providerAvailability.providerId, provider.id),
-    });
-    const exceptionRow = await db.query.availabilityExceptions.findFirst({
-      where: and(eq(availabilityExceptions.providerId, provider.id), eq(availabilityExceptions.date, candidateDate)),
-    });
-    const candidateSlots = calculateAvailableSlots({
-      date: candidateDate,
-      timezone: provider.timezone,
-      serviceDurationMinutes: service.durationMinutes,
-      weeklyRules: weeklyRules.map((r) => ({ dayOfWeek: r.dayOfWeek, startTime: r.startTime, endTime: r.endTime })),
-      exception: exceptionRow
-        ? { type: exceptionRow.type, startTime: exceptionRow.startTime, endTime: exceptionRow.endTime }
-        : null,
-      now: new Date(),
-    });
-
-    // Slots already consumed by another active booking for this provider
-    // (any service — the same provider can't be in two appointments at
-    // once) must also be excluded before checking membership.
-    const activeBookings = await db.query.bookings.findMany({
-      where: and(eq(bookings.providerId, provider.id), inArray(bookings.status, [...BLOCKING_BOOKING_STATUSES])),
-    });
-    const availableSlots = excludeBookedSlots(
-      candidateSlots,
-      service.durationMinutes,
-      activeBookings.map((b) => ({ startAt: b.startAt, endAt: b.endAt })),
-    );
-
-    const requestedIso = formatZonedIso(requestedInstant, provider.timezone);
-    if (!availableSlots.includes(requestedIso)) {
-      return c.json({ error: "This time slot is not available" }, 409);
-    }
-
-    const endAt = new Date(requestedInstant.getTime() + service.durationMinutes * 60_000);
-
     try {
       const result = await db.transaction(async (tx) => {
+        // --- Authoritative reads -------------------------------------
+        const [provider] = await tx.select().from(providers).where(eq(providers.id, providerId)).for("update");
+        if (!provider) throw new BookingRouteError(404, PROVIDER_NOT_FOUND);
+        if (provider.status !== "ACTIVE") {
+          throw new BookingRouteError(409, { error: "This provider is not currently accepting bookings" });
+        }
+
+        const [service] = await tx
+          .select()
+          .from(services)
+          .where(and(eq(services.id, serviceId), eq(services.providerId, providerId)))
+          .for("update");
+        if (!service) throw new BookingRouteError(404, SERVICE_NOT_FOUND);
+        if (!service.active) {
+          throw new BookingRouteError(409, { error: "This service is no longer available" });
+        }
+
+        // Ownership is derived from the session, never a client-supplied
+        // customerUserId — createBookingSchema has no such field. A pet
+        // that exists but belongs to someone else returns the same 404 as
+        // a nonexistent one (the established IDOR-hiding convention).
+        const [pet] = await tx.select().from(pets).where(eq(pets.id, petId));
+        if (!pet || pet.ownerId !== user.id) {
+          throw new BookingRouteError(404, PET_NOT_FOUND);
+        }
+
+        // Idempotency is checked BEFORE availability re-validation, not
+        // after — a legitimate replay of a request that already succeeded
+        // would otherwise be rejected by the availability check below,
+        // since the booking IT created is now (correctly) occupying that
+        // exact slot. This read alone doesn't claim the key (the
+        // insert-with-onConflictDoNothing below does that); it only
+        // short-circuits a sequential replay early.
+        if (idempotencyKey) {
+          const existingClaim = await tx.query.bookingIdempotencyKeys.findFirst({
+            where: and(eq(bookingIdempotencyKeys.customerUserId, user.id), eq(bookingIdempotencyKeys.key, idempotencyKey)),
+          });
+          if (existingClaim && existingClaim.bookingId !== null) {
+            if (existingClaim.requestHash !== requestHash) {
+              throw new IdempotencyConflictError();
+            }
+            const existingBooking = await tx.query.bookings.findFirst({ where: eq(bookings.id, existingClaim.bookingId) });
+            if (existingBooking) {
+              return { booking: existingBooking, replay: true };
+            }
+          }
+        }
+
+        // Re-validate the requested instant against the SAME algorithm
+        // the public availability endpoint uses — not a second
+        // implementation of "what's a legal slot." This alone enforces
+        // slot-interval alignment, full-duration-fits-in-window,
+        // exception precedence, and not-in-the-past, all in one reused
+        // call — using the provider/service rows just locked above, never
+        // anything read before this transaction began.
+        const candidateDate = zonedDateString(requestedInstant, provider.timezone);
+        const weeklyRules = await tx.query.providerAvailability.findMany({
+          where: eq(providerAvailability.providerId, provider.id),
+        });
+        const exceptionRow = await tx.query.availabilityExceptions.findFirst({
+          where: and(eq(availabilityExceptions.providerId, provider.id), eq(availabilityExceptions.date, candidateDate)),
+        });
+        const candidateSlots = calculateAvailableSlots({
+          date: candidateDate,
+          timezone: provider.timezone,
+          serviceDurationMinutes: service.durationMinutes,
+          weeklyRules: weeklyRules.map((r) => ({ dayOfWeek: r.dayOfWeek, startTime: r.startTime, endTime: r.endTime })),
+          exception: exceptionRow
+            ? { type: exceptionRow.type, startTime: exceptionRow.startTime, endTime: exceptionRow.endTime }
+            : null,
+          now: new Date(),
+        });
+
+        // Slots already consumed by another active booking for this
+        // provider (any service — the same provider can't be in two
+        // appointments at once) must also be excluded before checking
+        // membership.
+        const activeBookings = await tx.query.bookings.findMany({
+          where: and(eq(bookings.providerId, provider.id), inArray(bookings.status, [...BLOCKING_BOOKING_STATUSES])),
+        });
+        const availableSlots = excludeBookedSlots(
+          candidateSlots,
+          service.durationMinutes,
+          activeBookings.map((b) => ({ startAt: b.startAt, endAt: b.endAt })),
+        );
+
+        const requestedIso = formatZonedIso(requestedInstant, provider.timezone);
+        if (!availableSlots.includes(requestedIso)) {
+          throw new BookingRouteError(409, { error: "This time slot is not available" });
+        }
+
+        // --- Derive booking values from the fresh rows above ----------
+        const endAt = new Date(requestedInstant.getTime() + service.durationMinutes * 60_000);
+
         if (idempotencyKey) {
           const [claimed] = await tx
             .insert(bookingIdempotencyKeys)
@@ -188,6 +221,7 @@ export function createBookingRoutes(db: DbClient, nodeEnv: string) {
           }
         }
 
+        // --- Insert, relying on database constraints -------------------
         const [inserted] = await tx
           .insert(bookings)
           .values({
@@ -217,6 +251,9 @@ export function createBookingRoutes(db: DbClient, nodeEnv: string) {
 
       return c.json({ booking: toPublicBooking(result.booking) }, result.replay ? 200 : 201);
     } catch (err) {
+      if (err instanceof BookingRouteError) {
+        return c.json(err.body, err.status);
+      }
       if (err instanceof IdempotencyConflictError) {
         return c.json({ error: "Idempotency-Key was already used with different booking parameters" }, 409);
       }

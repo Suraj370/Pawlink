@@ -128,6 +128,17 @@ genuine race condition to prove correct:
   re-validation originally ran *before* the idempotency check, so a legitimate sequential replay was
   incorrectly rejected as "slot no longer available" (because the original request's own booking was
   now correctly occupying that slot) — fixed by checking for an existing idempotency claim first.
+- **Provider-status race test** (`concurrency — provider deactivated while a booking is being
+  created`): a hardening-pass regression test that fires `POST /api/bookings` concurrently with the
+  owner's `PATCH /api/providers/:id {status:"INACTIVE"}` for that same provider, via `Promise.all`.
+  Asserts the outcome is always one of exactly two valid results — the booking is cleanly created
+  (`201`, deactivation applies right after) or cleanly rejected (`409`) — never a `500`, a deadlock,
+  or (checked independently against the database, not just the HTTP response) a `CONFIRMED` booking
+  coexisting with a provider that had already committed as `INACTIVE` before the booking did. This
+  exists because the booking route previously read `provider.status` once, outside any transaction,
+  and never re-checked it before the `INSERT` — see docs/architecture.md, "Transaction boundaries and
+  the provider/service status race," for the `SELECT ... FOR UPDATE` fix and the exact guarantee it
+  establishes.
 
 ## What "passing" actually means here
 

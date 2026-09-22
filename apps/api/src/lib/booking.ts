@@ -79,6 +79,22 @@ export function hashBookingRequest(input: CreateBookingInput): string {
 export class IdempotencyConflictError extends Error {}
 export class IdempotencyRaceError extends Error {}
 
+// Carries a specific HTTP response out of the booking transaction. Thrown
+// only for conditions discovered by the AUTHORITATIVE in-transaction reads
+// (provider/service/pet/availability) — never a substitute for Zod input
+// validation, which still happens before the transaction opens. Throwing
+// rolls the transaction back (nothing has been written yet at that point),
+// and the route handler's catch block converts it back into the same
+// response shape the pre-hardening code returned for each case.
+export class BookingRouteError extends Error {
+  constructor(
+    public readonly status: 404 | 409,
+    public readonly body: Record<string, unknown>,
+  ) {
+    super(`BookingRouteError(${status})`);
+  }
+}
+
 export function excludeBookedSlots(
   candidateSlots: string[],
   serviceDurationMinutes: number,

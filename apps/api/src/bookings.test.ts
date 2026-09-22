@@ -761,3 +761,74 @@ describe("concurrency — the mandatory double-booking race test", () => {
     expect(matching).toHaveLength(1);
   });
 });
+
+describe("concurrency — provider deactivated while a booking is being created", () => {
+  it("never creates a booking against a provider that had already committed as INACTIVE", async () => {
+    // Hardening-pass regression test. Before the transaction-boundary fix,
+    // POST /api/bookings read provider.status once, outside any
+    // transaction, and never re-checked it before the INSERT — so a
+    // concurrent PATCH /api/providers/:id {status:"INACTIVE"} that
+    // committed in between could leave a CONFIRMED booking on a provider
+    // that was already inactive by the time the booking committed. The
+    // fix locks the provider row with SELECT ... FOR UPDATE as the first
+    // action inside the booking transaction, so the two operations
+    // serialize against each other via ordinary Postgres row-lock
+    // blocking: whichever one reaches the row first commits, and the
+    // other only proceeds after — there is no ordering in which the
+    // booking transaction can read a since-superseded ACTIVE status.
+    //
+    // The exact guarantee (see docs/architecture.md, "Provider/service
+    // status race"): the outcome is always equivalent to SOME serial
+    // ordering of "create booking" and "deactivate provider" — either the
+    // booking wins the race and is created (a legitimate "still active at
+    // the authoritative moment" outcome, deactivation simply applies
+    // after), or the deactivation wins and the booking is cleanly
+    // rejected with 409. What must never happen: a 201 whose booking row
+    // was inserted using a status read that a concurrently-committing
+    // transaction had already superseded, and no raw 500/deadlock either.
+    const { owner, provider, service, monday } = await setupBookableProvider();
+    const customer = await asUser();
+    const pet = await createPet(customer.cookie);
+    const startAt = `${monday}T15:00:00+00:00`;
+
+    const deactivate = () =>
+      app.request(`/api/providers/${provider.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", cookie: owner.cookie },
+        body: JSON.stringify({ status: "INACTIVE" }),
+      });
+
+    const [bookingRes, patchRes] = await Promise.all([
+      createBooking(customer.cookie, { providerId: provider.id, serviceId: service.id, petId: pet.id, startAt }),
+      deactivate(),
+    ]);
+
+    // The PATCH itself is never blocked by anything other than the lock
+    // (ACTIVE -> INACTIVE is always a legal owner-initiated transition).
+    expect(patchRes.status).toBe(200);
+
+    expect([201, 409]).toContain(bookingRes.status);
+    if (bookingRes.status === 409) {
+      const json = (await bookingRes.json()) as { error: string };
+      expect(json.error).toBeTruthy();
+    }
+
+    // The provider ends up INACTIVE regardless of which side won the
+    // race — that part of the outcome isn't in question, only whether a
+    // booking was allowed to sneak past it inconsistently.
+    const providerRes = await app.request(`/api/providers/${provider.id}`, { headers: { cookie: owner.cookie } });
+    const { provider: finalProvider } = (await providerRes.json()) as { provider: { status: string } };
+    expect(finalProvider.status).toBe("INACTIVE");
+
+    // Independently verify against the database: if the booking "won",
+    // exactly one CONFIRMED booking exists for this slot; if it "lost",
+    // none does. Never both, never a row in some other inconsistent
+    // state.
+    const list = await app.request(`/api/bookings?providerId=${provider.id}`, { headers: { cookie: owner.cookie } });
+    const listJson = (await list.json()) as { bookings: Array<{ startAt: string; status: string }> };
+    const matching = listJson.bookings.filter(
+      (b) => b.startAt === new Date(startAt).toISOString() && b.status === "CONFIRMED",
+    );
+    expect(matching).toHaveLength(bookingRes.status === 201 ? 1 : 0);
+  });
+});

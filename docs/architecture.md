@@ -282,6 +282,80 @@ the same slot, and the equivalent Vitest test firing two `Promise.all`-concurren
 one succeeds (`201`), the other gets a clean `409` — the route catches the `23P01` error code and
 returns `{ "error": "This time slot was just booked by someone else" }`, never a raw database error.
 
+### Transaction boundaries and the provider/service status race
+
+Everything `POST /api/bookings` treats as authoritative — provider, service, pet, weekly rules,
+date exceptions, and currently-active bookings for the provider — is read **inside** the single
+transaction that ultimately performs the `INSERT`, not before it. Nothing computed or read prior to
+`BEGIN` is reused for validation or for the values written to the `bookings` row: `BEGIN` →
+authoritative reads → authoritative validation → derive booking values from those fresh rows →
+insert → rely on database constraints (`EXCLUDE`, idempotency-key uniqueness) → `COMMIT`. This
+matters because the naive shape — "load provider / load service / load pet / validate availability
+/ *then* `BEGIN` / `INSERT` / `COMMIT`" — looks transactional but isn't: every one of those upstream
+reads can go stale between being read and the transaction committing, and the transaction itself
+never re-checks them.
+
+Concretely, `provider.status` and `service.active` are mutable and can change out from under an
+in-flight booking request (an owner calling `PATCH /api/providers/:id` to deactivate, concurrently
+with a customer booking that same provider). To close this, the provider and service rows are locked
+with **`SELECT ... FOR UPDATE`** as the first action inside the booking transaction:
+
+```ts
+const [provider] = await tx.select().from(providers).where(eq(providers.id, providerId)).for("update");
+// ...
+const [service] = await tx.select().from(services)
+  .where(and(eq(services.id, serviceId), eq(services.providerId, providerId)))
+  .for("update");
+```
+
+`FOR UPDATE` makes Postgres's ordinary row-lock queuing do the serialization: a concurrent
+`UPDATE providers ... WHERE id = $1` (what `PATCH /api/providers/:id` issues) takes the same row
+lock, so whichever transaction — the booking or the status change — reaches that specific row first
+is the one the other blocks behind, until the first commits or rolls back. The two transactions can
+never interleave in a way that lets one observe a value the other has since overwritten but not yet
+committed.
+
+**The exact guarantee this establishes**: the observable outcome of "customer books" racing against
+"provider becomes inactive" is always equivalent to *some* legal serial ordering of the two — never
+anything in between.
+
+- If the booking transaction's `FOR UPDATE` reaches the provider row first, it reads `ACTIVE`,
+  passes validation, and commits a `CONFIRMED` booking — equivalent to the booking having been made
+  a moment before the deactivation, which is already a documented, correct scenario (see
+  *Provider/service change scenarios* below: an existing booking survives a later deactivation).
+  The `PATCH` blocks until that commit, then applies as normal.
+- If the `PATCH`'s `UPDATE` reaches the row first and commits `INACTIVE`, the booking transaction's
+  `FOR UPDATE` — which had been blocked behind that lock — proceeds only after, reads the
+  now-committed `INACTIVE` status, and the request is rejected with a clean `409`
+  (`"This provider is not currently accepting bookings"`). No booking is ever created.
+
+What can never happen: a booking committed using a provider/service status that a concurrently
+committing transaction had already superseded by the time of commit. There is no ordering of the two
+operations under which a `CONFIRMED` booking and an already-effective `INACTIVE` status can coexist
+as the result of that race. This is verified directly — not just reasoned about — by a dedicated
+concurrency test (`apps/api/src/bookings.test.ts`, "provider deactivated while a booking is being
+created") that fires the `POST /api/bookings` and the deactivating `PATCH` as genuinely concurrent
+`Promise.all` requests and asserts the outcome is always one of the two valid results above, verified
+independently against the database, never a `500`, a deadlock, or a booking that outlives an
+already-committed deactivation.
+
+**Trade-off, deliberately accepted**: locking the provider row with `FOR UPDATE` serializes *all*
+concurrent booking attempts against that same provider — even two requests for non-overlapping time
+slots now queue behind each other for the (very short) duration of one transaction, rather than
+proceeding fully in parallel. This is the standard, correct cost of a real consistency guarantee at
+realistic single-provider booking volume, and it does not extend to other providers: locking is
+per-row, so requests against different providers never contend with each other.
+
+The `pets` table is deliberately **not** given `FOR UPDATE` treatment: it has no mutable status field
+that could go stale the way `provider.status`/`service.active` can, and `bookings.pet_id` is a
+`RESTRICT` (never `CASCADE`) foreign key, so a pet vanishing mid-flight would surface as a foreign
+key violation rather than silently producing a bad row. It's still re-read inside the transaction
+(for a fresh ownership check), just without lock-strength contention that nothing here needs.
+`weeklyRules`, the date exception, and currently-active bookings for the provider are likewise moved
+inside the transaction (so the flow matches `BEGIN → authoritative reads → ...` literally), but don't
+need `FOR UPDATE` either — double-booking correctness is still ultimately backstopped by the
+`EXCLUDE` constraint regardless of any staleness in that particular read.
+
 ### Idempotency
 
 `POST /api/bookings` accepts an optional `Idempotency-Key` header. Keys are scoped per customer
@@ -298,12 +372,13 @@ reuse of the same key for a *materially different* one:
 - **No expiry**: a key remains valid to safely retry indefinitely. A time-bounded expiry would need
   a cleanup job, out of scope for this milestone (see Known limitations).
 
-The mechanism is checked in **two places**, deliberately: first as a plain read *before* the
-availability re-validation (so a sequential replay of an already-succeeded request isn't wrongly
-rejected by the availability check, since the booking IT created is now correctly occupying that
-exact slot), and second as the actual transactional claim, inside the same database transaction
-that creates the booking. That second check is what makes truly concurrent same-key requests
-correct: the claim is `INSERT ... ON CONFLICT DO NOTHING` against the composite primary key, so a
+The mechanism is checked in **two places**, deliberately, both inside the same booking transaction
+described above: first as a plain read *before* the availability re-validation (so a sequential
+replay of an already-succeeded request isn't wrongly rejected by the availability check, since the
+booking IT created is now correctly occupying that exact slot), and second as the actual
+transactional claim, immediately before the insert. That second check is what makes truly concurrent
+same-key requests correct: the claim is `INSERT ... ON CONFLICT DO NOTHING` against the composite
+primary key, so a
 second concurrent transaction attempting the same insert is blocked by Postgres's ordinary row lock
 until the first transaction commits (with the booking id filled in) or rolls back (with the row
 gone entirely) — no polling, no manual locking, just relying on standard transactional semantics.
