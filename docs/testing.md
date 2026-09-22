@@ -139,6 +139,27 @@ genuine race condition to prove correct:
   and never re-checked it before the `INSERT` — see docs/architecture.md, "Transaction boundaries and
   the provider/service status race," for the `SELECT ... FOR UPDATE` fix and the exact guarantee it
   establishes.
+- **Cancellation race test** (`cancellation race`): fires two concurrent
+  `POST /api/bookings/:id/cancel` requests for the same `CONFIRMED` booking — one from the customer,
+  one from the provider owner. Asserts exactly one `200` and one `409` (never two `200`s), with the
+  booking ending in `CANCELLED`. See docs/architecture.md, "Cancellation race," for why the plain
+  read-then-write shape needed the same `SELECT ... FOR UPDATE` treatment as booking creation.
+- **10-way concurrency stress test** (`concurrency stress`): strengthens the mandatory double-booking
+  race test from 2 to 10 concurrent `POST /api/bookings` requests, from 10 different customers, for
+  the exact same provider/service/slot. Asserts exactly one `201` and nine `409`s, and independently
+  re-queries the database for exactly one `CONFIRMED` booking — proving the `EXCLUDE` constraint (and
+  the availability re-check) holds under a wider field, not just a two-way race.
+- **Idempotency hardening tests**: two different customers using the identical key string never
+  collide (keys are scoped per `(customer_user_id, key)`); a request that fails application-level
+  validation (e.g. the slot is already taken) leaves no idempotency claim behind at all, so the same
+  key can be legitimately reused for a new, valid request afterward — proven directly by retrying
+  with the same key and a different, available slot and asserting a clean `201`, not a stale
+  conflict.
+- **Transaction-failure / no-partial-records test**: after a booking attempt is rejected (slot
+  already taken, with an `Idempotency-Key` attached), asserts the rejected customer has zero bookings
+  and that the same key is provably unclaimed — confirming the whole transaction (including the
+  idempotency claim insert) rolled back atomically, never leaving a booking-less claim or a
+  claim-less booking behind.
 
 ## What "passing" actually means here
 

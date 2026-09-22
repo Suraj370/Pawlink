@@ -244,6 +244,48 @@ three independent places that all need to agree with it: `excludeBookedSlots`'s 
 database `EXCLUDE` constraint's `WHERE` clause (see below), and nowhere else — there is no fourth
 copy of this list anywhere in the codebase.
 
+### Cancellation race
+
+`POST /api/bookings/:id/cancel` has the same TOCTOU shape as booking creation, at a smaller scale: a
+plain read of the booking's current `status`, an application-level check
+(`assertBookingStatusTransition`), then a write. Two concurrent cancel requests for the same
+booking — e.g. the customer and the provider owner both cancelling at the same moment — could both
+read `CONFIRMED`, both pass the transition check, and both unconditionally overwrite the row. The
+data would still end up `CANCELLED` either way (there's no worse state to reach), but the API would
+incorrectly report `200` to both callers instead of one `200` and one `409`, silently masking that a
+second, logically invalid transition attempt happened.
+
+The fix mirrors booking creation: the handler locks the booking row with `SELECT ... FOR UPDATE` as
+the first action inside a transaction, then re-checks the transition and performs the update, all
+before `COMMIT`. The loser's `SELECT ... FOR UPDATE` blocks until the winner's transaction commits,
+so it reads the true, now-`CANCELLED` status and `assertBookingStatusTransition` correctly rejects
+`CANCELLED -> CANCELLED` with a `409` — deterministically, not depending on which request's
+`UPDATE` statement happened to run last. Verified by a dedicated concurrency test
+(`apps/api/src/bookings.test.ts`, "cancellation race") that fires both cancel requests concurrently
+and asserts exactly one `200` and one `409`, with the booking ending in `CANCELLED`.
+
+### Time-of-check/time-of-use audit
+
+As part of this hardening pass, every `SELECT` → validate → `INSERT`/`UPDATE` pattern in the booking
+engine (`apps/api/src/routes/bookings.ts`) was reviewed for staleness risk between the read and the
+write, with an explicit decision recorded for each:
+
+| Read | Risk if stale | Decision |
+| --- | --- | --- |
+| `provider` (status) | A deactivated/suspended provider could receive a new booking | **Row lock** — `SELECT ... FOR UPDATE` inside the booking transaction (see above) |
+| `service` (active, price, duration) | A deactivated service could receive a new booking; a race could snapshot inconsistent price/duration | **Row lock** — `SELECT ... FOR UPDATE` inside the booking transaction |
+| `pet` (ownership) | Negligible — no mutable status field, and `bookings.pet_id` is a `RESTRICT` foreign key | **Plain re-read inside the transaction**, no lock needed; a vanished pet surfaces as a foreign-key violation rather than bad data |
+| Weekly rules / date exception | A rule change mid-request could theoretically admit a slot the owner just closed | **Advisory, intentionally** — the owner's own schedule edit racing their own customer's booking is a narrow, low-stakes window (worst case: one booking honored against a schedule edited moments later, which is no different from a booking made moments *before* the edit); re-read inside the transaction for freshness, but not lock-guarded |
+| Active bookings for the provider (double-booking check) | Two concurrent bookings could both pass the in-app overlap check | **Database constraint is the real authority** — the `bookings_no_overlapping_active` `EXCLUDE` constraint (see below) makes this impossible regardless of what the application-level check sees; the in-app check exists only to produce a clean `409` instead of relying solely on the constraint's error |
+| Idempotency claim | Two concurrent requests with the same key could both think they're first | **Database constraint is the real authority** — `INSERT ... ON CONFLICT DO NOTHING` against the composite primary key `(customer_user_id, key)` (see Idempotency below) |
+| Booking row on cancel (`status`) | Two concurrent cancels could both apply | **Row lock** — `SELECT ... FOR UPDATE` inside the cancel transaction (see Cancellation race above) |
+
+The same pattern exists elsewhere in the codebase (e.g. `providers.ts`'s `PATCH`/soft-delete
+re-validating `status` before an unconditional `UPDATE ... WHERE id = $1`, and
+`availability.ts`'s weekly-rule overlap check before an `INSERT`) but those are outside this
+milestone's scope — the Booking Engine — and were not modified here; they're noted as a known gap
+for a future hardening pass on provider/availability management specifically, not silently ignored.
+
 ### Preventing double-booking: a database-enforced invariant, not an application check
 
 A naive "check for a conflict, then insert" is a textbook race: two concurrent requests can both

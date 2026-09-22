@@ -37,8 +37,17 @@ export function createBookingRoutes(db: DbClient, nodeEnv: string) {
 
   app.use("*", requireAuth);
 
-  async function loadProviderForBooking(booking: { providerId: string }, userId: string, userRole: string) {
-    const provider = await db.query.providers.findFirst({ where: eq(providers.id, booking.providerId) });
+  // Accepts either the outer `db` or an open transaction `tx` — both share
+  // the same relational query surface — so callers that need this check to
+  // participate in a transaction (cancellation, below) can pass `tx`
+  // instead of forcing a second, non-transactional round trip.
+  async function loadProviderForBooking(
+    booking: { providerId: string },
+    userId: string,
+    userRole: string,
+    queryable: Pick<DbClient, "query"> = db,
+  ) {
+    const provider = await queryable.query.providers.findFirst({ where: eq(providers.id, booking.providerId) });
     return !!provider && (provider.ownerUserId === userId || userRole === "ADMIN");
   }
 
@@ -347,37 +356,61 @@ export function createBookingRoutes(db: DbClient, nodeEnv: string) {
   // owner (or an admin) may cancel. Bookings are never hard-deleted —
   // cancellation only changes status, subject to the same state machine
   // used everywhere else.
+  //
+  // This is the same TOCTOU shape as booking creation: a plain
+  // read-then-write outside a transaction would let two concurrent
+  // cancel requests (e.g. the customer and the provider owner cancelling
+  // at the same moment) both read CONFIRMED, both pass
+  // assertBookingStatusTransition, and both unconditionally overwrite the
+  // row — the data ends up CANCELLED either way, but the API would
+  // (incorrectly) report 200 to both callers instead of one 200 and one
+  // 409 "already cancelled". Locking the booking row with
+  // SELECT ... FOR UPDATE as the first action inside a transaction
+  // closes that: the loser's read is forced to happen only after the
+  // winner's UPDATE has committed, so it observes the true CANCELLED
+  // status and its own transition check correctly rejects it.
   // -----------------------------------------------------------------------
   app.post("/:id/cancel", async (c) => {
     const idResult = uuidSchema.safeParse(c.req.param("id"));
     if (!idResult.success) return c.json({ error: "Invalid booking id" }, 400);
 
     const user = c.get("user");
-    const booking = await db.query.bookings.findFirst({ where: eq(bookings.id, idResult.data) });
-    if (!booking) return c.json(BOOKING_NOT_FOUND, 404);
-
-    const isCustomer = booking.customerUserId === user.id;
-    const isProviderOwner = isCustomer ? false : await loadProviderForBooking(booking, user.id, user.role);
-    if (!isCustomer && !isProviderOwner) {
-      return c.json(BOOKING_NOT_FOUND, 404);
-    }
 
     try {
-      assertBookingStatusTransition(booking.status, "CANCELLED");
+      const updated = await db.transaction(async (tx) => {
+        const [booking] = await tx.select().from(bookings).where(eq(bookings.id, idResult.data)).for("update");
+        if (!booking) throw new BookingRouteError(404, BOOKING_NOT_FOUND);
+
+        const isCustomer = booking.customerUserId === user.id;
+        const isProviderOwner = isCustomer ? false : await loadProviderForBooking(booking, user.id, user.role, tx);
+        if (!isCustomer && !isProviderOwner) {
+          throw new BookingRouteError(404, BOOKING_NOT_FOUND);
+        }
+
+        try {
+          assertBookingStatusTransition(booking.status, "CANCELLED");
+        } catch (err) {
+          if (err instanceof BookingStatusTransitionError) {
+            throw new BookingRouteError(409, { error: err.message });
+          }
+          throw err;
+        }
+
+        const [row] = await tx
+          .update(bookings)
+          .set({ status: "CANCELLED", updatedAt: new Date() })
+          .where(eq(bookings.id, idResult.data))
+          .returning();
+        return row;
+      });
+
+      return c.json({ booking: toPublicBooking(updated) }, 200);
     } catch (err) {
-      if (err instanceof BookingStatusTransitionError) {
-        return c.json({ error: err.message }, 409);
+      if (err instanceof BookingRouteError) {
+        return c.json(err.body, err.status);
       }
       throw err;
     }
-
-    const [updated] = await db
-      .update(bookings)
-      .set({ status: "CANCELLED", updatedAt: new Date() })
-      .where(eq(bookings.id, idResult.data))
-      .returning();
-
-    return c.json({ booking: toPublicBooking(updated) }, 200);
   });
 
   return app;

@@ -359,16 +359,26 @@ describe("POST /api/bookings — mass assignment ignored", () => {
       priceMinor: 1,
       currency: "USD",
       endAt: `${monday}T09:01:00+00:00`,
+      serviceNameSnapshot: "Fake",
       serviceDurationMinutesSnapshot: 1,
       status: "CONFIRMED",
     });
     expect(res.status).toBe(201);
     const json = (await res.json()) as {
-      booking: { id: string; priceMinor: number; currency: string; endAt: string; serviceDurationMinutes: number };
+      booking: {
+        id: string;
+        priceMinor: number;
+        currency: string;
+        endAt: string;
+        serviceName: string;
+        serviceDurationMinutes: number;
+      };
     };
-    // Server-derived values, not the injected ones.
+    // Server-derived values — from the authoritative service row read
+    // inside the booking transaction — never the client-injected ones.
     expect(json.booking.priceMinor).toBe(79900);
     expect(json.booking.currency).toBe("INR");
+    expect(json.booking.serviceName).toBe("Consultation");
     expect(json.booking.serviceDurationMinutes).toBe(60);
     expect(json.booking.endAt).toBe(new Date(`${monday}T10:00:00+00:00`).toISOString());
 
@@ -382,6 +392,27 @@ describe("POST /api/bookings — mass assignment ignored", () => {
     const victimList = await app.request("/api/bookings", { headers: { cookie: victim.cookie } });
     const victimJson = (await victimList.json()) as { bookings: Array<{ id: string }> };
     expect(victimJson.bookings.some((b) => b.id === json.booking.id)).toBe(false);
+  });
+
+  it("ignores unknown/extra fields entirely, consistent with the repo's Zod policy (unrecognized keys stripped, not rejected)", async () => {
+    const { provider, service, monday } = await setupBookableProvider();
+    const customer = await asUser();
+    const pet = await createPet(customer.cookie);
+
+    const res = await createBooking(customer.cookie, {
+      providerId: provider.id,
+      serviceId: service.id,
+      petId: pet.id,
+      startAt: `${monday}T14:00:00+00:00`,
+      isAdmin: true,
+      __proto__: { polluted: true },
+      createdAt: "2000-01-01T00:00:00Z",
+      updatedAt: "2000-01-01T00:00:00Z",
+    });
+    expect(res.status).toBe(201);
+    const json = (await res.json()) as { booking: Record<string, unknown> };
+    expect(json.booking).not.toHaveProperty("isAdmin");
+    expect(json.booking).not.toHaveProperty("polluted");
   });
 });
 
@@ -830,5 +861,292 @@ describe("concurrency — provider deactivated while a booking is being created"
       (b) => b.startAt === new Date(startAt).toISOString() && b.status === "CONFIRMED",
     );
     expect(matching).toHaveLength(bookingRes.status === 201 ? 1 : 0);
+  });
+});
+
+describe("availability correctness — booking creation rejects everything the availability endpoint would", () => {
+  it("rejects a timestamp outside a CUSTOM_HOURS date exception's narrowed window", async () => {
+    // The weekly rule alone (09:00-17:00) would normally allow 09:00, but
+    // a CUSTOM_HOURS exception on this exact date narrows the window to
+    // 11:00-12:00 — reusing calculateAvailableSlots, not a second
+    // algorithm, so this must be respected identically to the public
+    // availability endpoint.
+    const { owner, provider, service, monday } = await setupBookableProvider();
+    await app.request(`/api/providers/${provider.id}/availability/exceptions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie: owner.cookie },
+      body: JSON.stringify({ date: monday, type: "CUSTOM_HOURS", startTime: "11:00", endTime: "12:00" }),
+    });
+    const customer = await asUser();
+    const pet = await createPet(customer.cookie);
+
+    const outside = await createBooking(customer.cookie, {
+      providerId: provider.id,
+      serviceId: service.id,
+      petId: pet.id,
+      startAt: `${monday}T09:00:00+00:00`,
+    });
+    expect(outside.status).toBe(409);
+
+    const inside = await createBooking(customer.cookie, {
+      providerId: provider.id,
+      serviceId: service.id,
+      petId: pet.id,
+      startAt: `${monday}T11:00:00+00:00`,
+    });
+    expect(inside.status).toBe(201);
+  });
+});
+
+describe("idempotency hardening", () => {
+  it("lets two different customers use the identical key string without colliding", async () => {
+    // Keys are scoped per (customer_user_id, key) — a shared key string
+    // between unrelated customers must not let one's claim or replay
+    // affect the other's booking at all.
+    const { provider, service, monday } = await setupBookableProvider();
+    const customerA = await asUser();
+    const petA = await createPet(customerA.cookie);
+    const customerB = await asUser();
+    const petB = await createPet(customerB.cookie);
+    const sharedKey = "shared-key-different-customers";
+
+    const resA = await createBooking(
+      customerA.cookie,
+      { providerId: provider.id, serviceId: service.id, petId: petA.id, startAt: `${monday}T09:00:00+00:00` },
+      { "Idempotency-Key": sharedKey },
+    );
+    const resB = await createBooking(
+      customerB.cookie,
+      { providerId: provider.id, serviceId: service.id, petId: petB.id, startAt: `${monday}T10:00:00+00:00` },
+      { "Idempotency-Key": sharedKey },
+    );
+
+    expect(resA.status).toBe(201);
+    expect(resB.status).toBe(201);
+    const bookingA = ((await resA.json()) as { booking: { id: string } }).booking;
+    const bookingB = ((await resB.json()) as { booking: { id: string } }).booking;
+    expect(bookingA.id).not.toBe(bookingB.id);
+  });
+
+  it("does not permanently poison a key after a request that failed application-level validation", async () => {
+    // A request that never reaches the actual insert (rejected by the
+    // authoritative availability re-check, here because the slot is
+    // already taken) must not leave behind any idempotency claim — the
+    // transaction never got far enough to write one — so the SAME key can
+    // be legitimately reused for a new, valid request afterward.
+    const { provider, service, monday } = await setupBookableProvider();
+    const customerA = await asUser();
+    const petA = await createPet(customerA.cookie);
+    await createBooking(customerA.cookie, { providerId: provider.id, serviceId: service.id, petId: petA.id, startAt: `${monday}T09:00:00+00:00` });
+
+    const customerB = await asUser();
+    const petB = await createPet(customerB.cookie);
+    const key = "idem-key-retry-after-failure";
+
+    const failed = await createBooking(
+      customerB.cookie,
+      { providerId: provider.id, serviceId: service.id, petId: petB.id, startAt: `${monday}T09:00:00+00:00` },
+      { "Idempotency-Key": key },
+    );
+    expect(failed.status).toBe(409);
+
+    // Same key, a genuinely different (and available) request — must
+    // succeed cleanly, not be treated as "key already used differently".
+    const retried = await createBooking(
+      customerB.cookie,
+      { providerId: provider.id, serviceId: service.id, petId: petB.id, startAt: `${monday}T13:00:00+00:00` },
+      { "Idempotency-Key": key },
+    );
+    expect(retried.status).toBe(201);
+  });
+});
+
+describe("cancellation race", () => {
+  it("exactly one of two concurrent cancel requests for the same booking succeeds; the other gets a clean 409", async () => {
+    // Customer and provider owner both cancel the same CONFIRMED booking
+    // at the same moment. Locking the booking row (SELECT ... FOR UPDATE
+    // inside the cancel transaction) serializes them — the loser's read
+    // happens only after the winner's UPDATE has committed, so it
+    // observes the true CANCELLED status and assertBookingStatusTransition
+    // correctly rejects CANCELLED -> CANCELLED, rather than both racing
+    // to silently double-apply the same write.
+    const { owner, provider, service, monday } = await setupBookableProvider();
+    const customer = await asUser();
+    const pet = await createPet(customer.cookie);
+    const created = await createBooking(customer.cookie, { providerId: provider.id, serviceId: service.id, petId: pet.id, startAt: `${monday}T09:00:00+00:00` });
+    const { booking } = (await created.json()) as { booking: { id: string } };
+
+    const [resCustomer, resOwner] = await Promise.all([
+      app.request(`/api/bookings/${booking.id}/cancel`, { method: "POST", headers: { cookie: customer.cookie } }),
+      app.request(`/api/bookings/${booking.id}/cancel`, { method: "POST", headers: { cookie: owner.cookie } }),
+    ]);
+
+    const statuses = [resCustomer.status, resOwner.status].sort();
+    expect(statuses).toEqual([200, 409]);
+
+    const finalRes = await app.request(`/api/bookings/${booking.id}`, { headers: { cookie: customer.cookie } });
+    const finalJson = (await finalRes.json()) as { booking: { status: string } };
+    expect(finalJson.booking.status).toBe("CANCELLED");
+  });
+});
+
+describe("transaction failure behavior — no partial records", () => {
+  it("a rejected booking (slot already taken) leaves no booking row and no idempotency claim behind", async () => {
+    const { provider, service, monday } = await setupBookableProvider();
+    const customerA = await asUser();
+    const petA = await createPet(customerA.cookie);
+    await createBooking(customerA.cookie, { providerId: provider.id, serviceId: service.id, petId: petA.id, startAt: `${monday}T09:00:00+00:00` });
+
+    const customerB = await asUser();
+    const petB = await createPet(customerB.cookie);
+    const key = "idem-key-partial-record-check";
+    const failed = await createBooking(
+      customerB.cookie,
+      { providerId: provider.id, serviceId: service.id, petId: petB.id, startAt: `${monday}T09:00:00+00:00` },
+      { "Idempotency-Key": key },
+    );
+    expect(failed.status).toBe(409);
+
+    // Customer B has no bookings at all — the failed attempt inserted
+    // nothing.
+    const listB = await app.request("/api/bookings", { headers: { cookie: customerB.cookie } });
+    const listBJson = (await listB.json()) as { bookings: unknown[] };
+    expect(listBJson.bookings).toHaveLength(0);
+
+    // The key is provably unclaimed: reusing it for a different, valid
+    // request succeeds as a fresh booking rather than replaying/
+    // conflicting against a phantom claim.
+    const retried = await createBooking(
+      customerB.cookie,
+      { providerId: provider.id, serviceId: service.id, petId: petB.id, startAt: `${monday}T14:00:00+00:00` },
+      { "Idempotency-Key": key },
+    );
+    expect(retried.status).toBe(201);
+  });
+});
+
+describe("concurrency stress — 10 concurrent attempts for the same slot", () => {
+  it(
+    "exactly one succeeds; every other request gets a controlled conflict, verified directly against the database",
+    async () => {
+    const { owner, provider, service, monday } = await setupBookableProvider();
+    const startAt = `${monday}T16:00:00+00:00`;
+    const attempts = 10;
+
+    const customers = await Promise.all(Array.from({ length: attempts }, () => asUser()));
+    const pets = await Promise.all(customers.map((cust) => createPet(cust.cookie)));
+
+    const results = await Promise.all(
+      customers.map((cust, i) => createBooking(cust.cookie, { providerId: provider.id, serviceId: service.id, petId: pets[i].id, startAt })),
+    );
+
+    const successCount = results.filter((r) => r.status === 201).length;
+    const conflictCount = results.filter((r) => r.status === 409).length;
+    expect(successCount).toBe(1);
+    expect(conflictCount).toBe(attempts - 1);
+    // No raw 500s, no unexpected status codes at all.
+    expect(results.every((r) => r.status === 201 || r.status === 409)).toBe(true);
+
+    // The database itself, not just the HTTP responses, has exactly one
+    // CONFIRMED booking for this exact appointment.
+    const list = await app.request(`/api/bookings?providerId=${provider.id}`, { headers: { cookie: owner.cookie } });
+    const listJson = (await list.json()) as { bookings: Array<{ startAt: string; status: string }> };
+    const matching = listJson.bookings.filter((b) => b.startAt === new Date(startAt).toISOString() && b.status === "CONFIRMED");
+    expect(matching).toHaveLength(1);
+    },
+    20_000,
+  );
+});
+
+describe("availability lifecycle — visible, then not, then visible again", () => {
+  it("a slot disappears from GET availability once booked and reappears once cancelled", async () => {
+    const { provider, service, monday } = await setupBookableProvider();
+    const customer = await asUser();
+    const pet = await createPet(customer.cookie);
+
+    const slotsBefore = await app.request(`/api/providers/${provider.id}/availability?date=${monday}&serviceId=${service.id}`);
+    const beforeJson = (await slotsBefore.json()) as { slots: string[] };
+    const targetInstant = new Date(`${monday}T09:00:00+00:00`).getTime();
+    const includesTargetSlot = (slots: string[]) => slots.some((iso) => new Date(iso).getTime() === targetInstant);
+    expect(includesTargetSlot(beforeJson.slots)).toBe(true);
+
+    const created = await createBooking(customer.cookie, { providerId: provider.id, serviceId: service.id, petId: pet.id, startAt: `${monday}T09:00:00+00:00` });
+    const { booking } = (await created.json()) as { booking: { id: string } };
+    expect(created.status).toBe(201);
+
+    const slotsAfter = await app.request(`/api/providers/${provider.id}/availability?date=${monday}&serviceId=${service.id}`);
+    const afterJson = (await slotsAfter.json()) as { slots: string[] };
+    expect(includesTargetSlot(afterJson.slots)).toBe(false);
+
+    await app.request(`/api/bookings/${booking.id}/cancel`, { method: "POST", headers: { cookie: customer.cookie } });
+
+    const slotsCancelled = await app.request(`/api/providers/${provider.id}/availability?date=${monday}&serviceId=${service.id}`);
+    const cancelledJson = (await slotsCancelled.json()) as { slots: string[] };
+    expect(includesTargetSlot(cancelledJson.slots)).toBe(true);
+  });
+});
+
+describe("historical booking behavior — provider deactivation after a booking exists", () => {
+  it("keeps an existing booking valid and viewable after the provider is deactivated", async () => {
+    const { owner, provider, service, monday } = await setupBookableProvider();
+    const customer = await asUser();
+    const pet = await createPet(customer.cookie);
+    const created = await createBooking(customer.cookie, { providerId: provider.id, serviceId: service.id, petId: pet.id, startAt: `${monday}T09:00:00+00:00` });
+    const { booking } = (await created.json()) as { booking: { id: string } };
+
+    await app.request(`/api/providers/${provider.id}`, { method: "DELETE", headers: { cookie: owner.cookie } });
+
+    const res = await app.request(`/api/bookings/${booking.id}`, { headers: { cookie: customer.cookie } });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { booking: { status: string } };
+    expect(json.booking.status).toBe("CONFIRMED");
+
+    // But a NEW booking against the now-inactive provider is rejected.
+    const pet2 = await createPet(customer.cookie);
+    const newAttempt = await createBooking(customer.cookie, { providerId: provider.id, serviceId: service.id, petId: pet2.id, startAt: `${monday}T11:00:00+00:00` });
+    expect(newAttempt.status).toBe(409);
+  });
+});
+
+describe("adversarial review", () => {
+  it("rejects an extremely oversized startAt value without crashing", async () => {
+    const { provider, service } = await setupBookableProvider();
+    const customer = await asUser();
+    const pet = await createPet(customer.cookie);
+    const res = await createBooking(customer.cookie, {
+      providerId: provider.id,
+      serviceId: service.id,
+      petId: pet.id,
+      startAt: "2031-01-06T09:00:00+00:00" + "0".repeat(50_000),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects a request body that is an array instead of an object", async () => {
+    const customer = await asUser();
+    const res = await app.request("/api/bookings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie: customer.cookie },
+      body: JSON.stringify([1, 2, 3]),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("a stolen-pet attempt against a booked slot never leaks a raw database error", async () => {
+    const { provider, service, monday } = await setupBookableProvider();
+    const customerA = await asUser();
+    const petA = await createPet(customerA.cookie);
+    const attacker = await asUser();
+
+    const res = await createBooking(attacker.cookie, {
+      providerId: provider.id,
+      serviceId: service.id,
+      petId: petA.id,
+      startAt: `${monday}T09:00:00+00:00`,
+    });
+    expect(res.status).toBe(404);
+    const json = (await res.json()) as { error: string };
+    expect(json.error.toLowerCase()).not.toContain("constraint");
+    expect(json.error.toLowerCase()).not.toContain("postgres");
   });
 });
