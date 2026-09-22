@@ -11,7 +11,7 @@ describe("GET /health", () => {
     const body = (await res.json()) as { status: string; service: string; timestamp: string };
     expect(body).toMatchObject({
       status: "ok",
-      service: "pawgrid-api",
+      service: "pawlink-api",
     });
     expect(typeof body.timestamp).toBe("string");
   });

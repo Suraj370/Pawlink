@@ -1,4 +1,4 @@
-# PawGrid — Getting Started
+# PawLink — Getting Started
 
 ## Prerequisites
 

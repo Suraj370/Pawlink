@@ -1,8 +1,8 @@
 {
-  "name": "pawgrid",
+  "name": "pawlink",
   "private": true,
   "version": "0.1.0",
-  "description": "PawGrid: a multi-sided pet-care platform",
+  "description": "PawLink: a multi-sided pet-care platform",
   "type": "module",
   "workspaces": [
     "apps/*",

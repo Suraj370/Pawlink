@@ -23,7 +23,7 @@ export default function App() {
 
   return (
     <main>
-      <h1>PawGrid</h1>
+      <h1>PawLink</h1>
       <p>This platform is under development.</p>
       <p data-testid="api-status">API status: {apiStatus}</p>
     </main>

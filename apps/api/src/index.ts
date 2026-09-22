@@ -6,5 +6,5 @@ const env = loadEnv();
 const app = createApp();
 
 serve({ fetch: app.fetch, port: env.PORT }, (info) => {
-  console.log(`PawGrid API listening on http://localhost:${info.port}`);
+  console.log(`PawLink API listening on http://localhost:${info.port}`);
 });

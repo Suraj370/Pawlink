@@ -1,4 +1,4 @@
-# PawGrid
+# PawLink
 
 A multi-sided pet-care platform. This repository currently contains the project foundation only — no business features are implemented yet.
 

@@ -6,6 +6,6 @@ export default defineConfig({
   out: "./drizzle",
   dialect: "postgresql",
   dbCredentials: {
-    url: process.env.DATABASE_URL ?? "postgres://pawgrid:pawgrid@localhost:5432/pawgrid",
+    url: process.env.DATABASE_URL ?? "postgres://pawlink:pawlink@localhost:5432/pawlink",
   },
 });

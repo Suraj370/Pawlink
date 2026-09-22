@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { logger } from "hono/logger";
 import { HTTPException } from "hono/http-exception";
-import { healthResponseSchema } from "@pawgrid/shared";
+import { healthResponseSchema } from "@pawlink/shared";
 
 export function createApp() {
   const app = new Hono();
@@ -11,7 +11,7 @@ export function createApp() {
   app.get("/health", (c) => {
     const body = healthResponseSchema.parse({
       status: "ok",
-      service: "pawgrid-api",
+      service: "pawlink-api",
       timestamp: new Date().toISOString(),
     });
     return c.json(body);
