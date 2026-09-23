@@ -16,10 +16,25 @@ export function hashSessionToken(token: string): string {
 }
 
 export function sessionCookieOptions(nodeEnv: string): CookieOptions {
+  const secure = nodeEnv === "production";
   return {
     httpOnly: true,
-    secure: nodeEnv === "production",
-    sameSite: "Lax",
+    secure,
+    // Production serves the frontend and API from different registrable
+    // domains (e.g. a Vercel domain and a Render/Fly domain), which
+    // makes every API call a cross-site request. SameSite=Lax cookies
+    // are only sent on top-level navigations, never on cross-site
+    // fetch/XHR — so with Lax here, the session cookie would never be
+    // sent back on GET /api/auth/me or any other API call, making every
+    // page refresh (and even the very next request after login) look
+    // unauthenticated. SameSite=None fixes that, and is only safe
+    // combined with Secure (browsers drop a None cookie outright
+    // without it) — which is exactly when this applies, since `secure`
+    // is only true in production. Dev/test stays on the stricter Lax:
+    // localhost:5173 and localhost:3000 differ only by port, which is
+    // still the same "site" for SameSite purposes, so Lax already works
+    // there without weakening anything.
+    sameSite: secure ? "None" : "Lax",
     path: "/",
     maxAge: SESSION_TTL_SECONDS,
   };
