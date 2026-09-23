@@ -15,6 +15,13 @@ import { createBookingRoutes } from "./routes/bookings.js";
 import { createBookingPaymentRoutes, createMockPaymentProvider, createPaymentRoutes } from "./routes/payments.js";
 import { createMedicalRecordRoutes, createPetMedicalRecordRoutes } from "./routes/medical-records.js";
 import { createBookingReviewRoutes, createProviderReviewRoutes, createReviewRoutes } from "./routes/reviews.js";
+import { createAdminDashboardRoutes } from "./routes/admin/dashboard.js";
+import { createAdminProviderRoutes } from "./routes/admin/providers.js";
+import { createAdminUserRoutes } from "./routes/admin/users.js";
+import { createAdminBookingRoutes } from "./routes/admin/bookings.js";
+import { createAdminPaymentRoutes } from "./routes/admin/payments.js";
+import { createAdminReviewRoutes } from "./routes/admin/reviews.js";
+import { createAdminAuditRoutes } from "./routes/admin/audit.js";
 
 export function createApp(db: DbClient, env: Env) {
   const app = new Hono<AppEnv>();
@@ -55,6 +62,13 @@ export function createApp(db: DbClient, env: Env) {
   app.route("/api/bookings/:bookingId/review", createBookingReviewRoutes(db, env.NODE_ENV));
   app.route("/api/reviews", createReviewRoutes(db, env.NODE_ENV));
   app.route("/api/providers/:providerId/reviews", createProviderReviewRoutes(db));
+  app.route("/api/admin/dashboard", createAdminDashboardRoutes(db, env.NODE_ENV));
+  app.route("/api/admin/providers", createAdminProviderRoutes(db, env.NODE_ENV));
+  app.route("/api/admin/users", createAdminUserRoutes(db, env.NODE_ENV));
+  app.route("/api/admin/bookings", createAdminBookingRoutes(db, env.NODE_ENV));
+  app.route("/api/admin/payments", createAdminPaymentRoutes(db, env.NODE_ENV));
+  app.route("/api/admin/reviews", createAdminReviewRoutes(db, env.NODE_ENV));
+  app.route("/api/admin/audit", createAdminAuditRoutes(db, env.NODE_ENV));
 
   app.notFound((c) => {
     return c.json({ error: "Not Found" }, 404);

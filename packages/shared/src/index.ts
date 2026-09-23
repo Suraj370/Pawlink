@@ -18,3 +18,4 @@ export * from "./payments.js";
 export * from "./medical-records.js";
 export * from "./audit.js";
 export * from "./reviews.js";
+export * from "./admin.js";

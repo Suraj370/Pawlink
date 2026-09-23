@@ -1032,9 +1032,9 @@ above.
 
 ### Known limitations
 
-- **No moderation workflow.** `reviews.status` exists as a schema-level hook (`PUBLISHED`/`HIDDEN`)
-  but nothing sets it to `HIDDEN` yet — flagging/hiding abusive reviews is explicit follow-up work
-  for the later "Admin / Operations" milestone, not this one.
+- **Moderation is admin-only, not community-driven.** `reviews.status` (`PUBLISHED`/`HIDDEN`) is now
+  actually used — see "Admin & operations," below — but only an admin can transition it; there's no
+  flagging/reporting mechanism for customers or providers to request moderation.
 - **No review deletion**, by the pet-owner-equivalent policy of "historical record, not silently
   erased" — see "Deletion," above.
 - **No automatic/time-based completion.** A booking only reaches `COMPLETED` when the provider
@@ -1042,3 +1042,267 @@ above.
   end time has passed. Providers who never mark an appointment complete leave that booking's
   customer permanently unable to review it — an accepted trade-off for this milestone rather than
   building a background job.
+
+## Admin & operations
+
+**Admin access is operational access, not unrestricted access to all customer data.** Every design
+decision in this milestone follows from that one sentence — most visibly in what an `ADMIN` account
+still *cannot* do: see medical records, mutate payment state, or rewrite audit history.
+
+### The admin role and its provisioning
+
+`ADMIN` is not a new role — it was already the fifth value in `ROLES`
+(`packages/shared/src/auth.ts`) since authentication was first built, already used for
+booking/provider-status bypasses elsewhere in this codebase. This milestone is the first time it
+gets a dedicated, first-class surface. There is, and has never been, any API endpoint that sets a
+user's role to `ADMIN` — registration always assigns `PET_PARENT`
+(`packages/shared/src/auth.ts`'s `registerSchema` has no `role` field), and there is no role-change
+endpoint anywhere in this milestone either, a deliberate scope decision the milestone brief
+explicitly allows ("it is acceptable to make role changes unavailable and provision admins through a
+controlled database/seed mechanism"). In practice this means the *only* way an account ever becomes
+`ADMIN` is a direct database write — exactly the same mechanism this codebase's own test suite has
+relied on since the very first milestone (`apps/api/src/test-helpers.ts`'s `promoteToAdmin`, and its
+Playwright-side equivalent added in this milestone, `e2e/db.ts`'s `promoteToAdminByEmail`). This is
+not a stopgap that happens to work for tests — it *is* the production admin-provisioning model for
+this version of the platform.
+
+### Server-side authorization — the one gate every admin route shares
+
+`createRequireAdmin` (`apps/api/src/middleware/auth.ts`) is the single reusable authorization
+primitive every one of the seven `/api/admin/*` route groups mounts as `app.use("*", ...)` before any
+handler runs. It layers directly on top of the existing session-resolution logic
+(`resolveUser`/`createRequireAuth`) so an unauthenticated caller still gets a `401` — never a
+misleading `403` that would imply the caller is merely unauthorized rather than not logged in at
+all — and only once authenticated does it check `role === "ADMIN"`, rejecting anyone else with a
+plain `403`.
+
+This deliberately does **not** follow this codebase's usual pets/bookings/medical-records/reviews
+convention of hiding a resource's existence behind a `404` for an unauthorized caller. That
+convention exists because those resources' *existence itself* can be sensitive (a stranger
+shouldn't learn whether a particular pet or booking id is real). The `/api/admin/*` namespace has no
+such secret — every authenticated user already knows an admin surface exists, in the same way every
+web app has *some* login page — so a plain, honest `403 Forbidden` is the correct response, and
+using `404` here would just be needless obscurity without a real security benefit.
+
+The admin role itself is read from the authenticated user's own database row
+(`resolveUser` → `toPublicUser` → `users.role`), via the same session-cookie resolution every other
+authenticated route already uses — never a client-supplied header, request-body field, query
+parameter, or frontend flag. A request that sends `{"role": "ADMIN"}` in its body, or an
+`X-User-Role: ADMIN` header, is simply never read for authorization purposes by any code path in
+this codebase.
+
+**Frontend route protection is UX only.** `apps/web/src/routes/_authenticated/admin/route.tsx`
+redirects a non-admin to `/dashboard` before rendering anything under `/admin`, so a customer or
+provider never even sees the admin shell — but this is purely so a non-admin isn't shown a confusing
+"Forbidden" page instead of a normal one. Nothing about that redirect is load-bearing for security:
+every admin API call an admin page makes would independently return `403` to a non-admin caller
+regardless of whether the frontend redirect fired, proven directly (not just asserted) by
+`admin-security.test.ts` hitting every `/api/admin/*` route group directly as an anonymous, a
+customer, and a provider-owner caller, and by `e2e/admin.spec.ts`'s dedicated security spec driving
+`page.request.get(...)` straight at the API from a non-admin browser session.
+
+### API namespace
+
+```
+GET  /api/admin/dashboard
+GET  /api/admin/providers            GET /api/admin/providers/:id
+POST /api/admin/providers/:id/status
+GET  /api/admin/users
+GET  /api/admin/bookings             GET /api/admin/bookings/:id
+GET  /api/admin/payments             GET /api/admin/payments/:id
+GET  /api/admin/reviews
+POST /api/admin/reviews/:id/hide     POST /api/admin/reviews/:id/publish
+GET  /api/admin/audit
+```
+
+Every list endpoint takes `page`/`pageSize` (capped, same `z.coerce.number().max(N).catch(default)`
+pattern every other paginated list in this codebase already uses — an absurdly large `pageSize`
+value fails schema validation and silently falls back to the default rather than being honored or
+rejected with an error) and resource-appropriate filters — `search`/`status`/`providerType` for
+providers, `search`/`role` for users, `status`/`providerId`/`paymentStatus`/`dateFrom`/`dateTo` for
+bookings, `status`/`bookingId` for payments, `status`/`providerId` for reviews, `action`/
+`resourceType` for audit entries — all validated by Zod (`packages/shared/src/admin.ts`) before ever
+reaching a query. Search filters use Drizzle's `ilike(column, \`%${term}%\`)`, which always binds the
+term as a parameter, never concatenates it into SQL text — a search string shaped like a SQL
+injection payload (`' OR '1'='1`) is treated as a completely inert literal value, never as SQL
+syntax (proven directly in `admin-security.test.ts`).
+
+### Provider management and status transitions
+
+`GET /api/admin/providers` reuses `toPublicProvider` (the exact same DTO shape a provider owner sees
+for their own listing — id, contact fields, `status`, `averageRating`, `reviewCount`) but, unlike
+public discovery, returns providers of **every** status, since an admin specifically needs to find
+an `INACTIVE` or `SUSPENDED` listing to act on it.
+
+`POST /api/admin/providers/:id/status` is the only mutation in this route group, and it does exactly
+one thing: change `providers.status`. It reuses `assertStatusTransitionAllowed`
+(`apps/api/src/lib/provider.ts`) — the SAME transition table the owner-facing
+`PATCH /api/providers/:id` route has relied on since the provider-management milestone — rather than
+inventing a second, parallel status-transition rule; since the actor is always `ADMIN` here, every
+transition is legal, including out of `SUSPENDED` (which an owner alone can never do — see Provider
+management, above, and `admin.test.ts`'s "the provider owner cannot unsuspend themselves"). The
+request body accepts exactly one field (`{"status": "..."}` — `adminProviderStatusSchema` has no
+other fields, so `ownerId`/`createdAt`/any other key sent alongside it is silently discarded before
+the route ever sees it, proven directly by a mass-assignment test). The status update and its audit
+event (`PROVIDER_STATUS_CHANGED`, `metadata: {previousStatus, newStatus}`) happen inside one
+`db.transaction`, with the provider row locked via `SELECT ... FOR UPDATE` first — either both writes
+land or neither does, and no concurrent status change can race past it unnoticed (see the milestone
+brief's explicit "do not create: provider suspended but no audit record").
+
+### Suspension does not touch historical data
+
+Suspending a provider writes to exactly one row — `providers.status` (plus the audit_logs insert).
+Nothing about this endpoint, or anything it calls, touches `bookings`, `payments`, `medical_records`,
+`services`, or `reviews`. The *effect* of suspension on future activity comes entirely from
+mechanisms that already existed before this milestone and needed no changes:
+
+- **New bookings are blocked** because `POST /api/bookings` already re-reads `provider.status` inside
+  its own transaction and rejects with `409` unless it's `ACTIVE` (see Booking engine, above) — a
+  suspended provider simply fails that existing check the same way an owner-deactivated one always
+  has.
+- **Public discovery hides it** because `GET /api/providers`/`GET /api/providers/:id` already only
+  show `ACTIVE` providers to non-owner/non-admin callers (see Provider management, above) — a
+  customer visiting a just-suspended provider's page gets the same "not found" a nonexistent
+  provider id would.
+- **Historical bookings, their payments, their medical records, and their reviews are all left
+  completely untouched** — proven directly in `admin.test.ts`, "suspension does not corrupt
+  historical data": a `COMPLETED` booking, its `SUCCEEDED` payment, and its review all still exist,
+  unchanged, immediately after the provider that fulfilled them is suspended.
+- **No mass-cancellation workflow exists or is implied.** A `CONFIRMED` future booking against a
+  newly-suspended provider is left exactly as it was — still visible to its customer, still
+  cancellable through the ordinary cancel flow, still completable by the (suspended) provider if the
+  appointment still goes ahead in practice. This is a deliberate scope decision, not an oversight:
+  the milestone brief explicitly says "do not invent a mass-cancellation workflow," and a real
+  product would need a considered policy here (automatic refund? manual review? customer
+  notification?) that's out of scope for this milestone.
+
+### User visibility — data minimization
+
+`GET /api/admin/users` (`toAdminUser`, `apps/api/src/lib/admin.ts`) returns exactly four fields per
+user: `id`, `name`, `role`, `createdAt`. Never `email`, never `phone`, never `passwordHash` (obviously
+never returned anywhere in this codebase), never a session token. This is a literal reading of the
+milestone brief's own example field list, not an accidental omission — search is by display name
+only (`ilike(users.name, ...)`), never by email, so there's no way to even probe for a matching
+account by email through this endpoint. There is no user-detail endpoint beyond the list, since the
+list already carries everything an operational view needs.
+
+### Booking and payment visibility — read-only
+
+`GET /api/admin/bookings` and `GET /api/admin/payments` are both entirely read-only: **no mutation
+endpoint of any kind exists for either resource under `/api/admin`.** This is deliberate and
+explicitly called out in the milestone brief ("operational visibility does not automatically mean
+mutation permission" for bookings; "an admin dashboard must not bypass payment invariants" for
+payments) — a booking's state still only ever changes through the existing customer/provider-facing
+lifecycle endpoints (create, cancel, complete), and a payment's state still only ever changes through
+the existing payment-provider/webhook flow. There is, in particular, **no way for an admin to
+manually mark a payment `SUCCEEDED`** — proven directly in `admin-security.test.ts` by hitting
+`PATCH`/`PUT`/`POST` on `/api/admin/payments/:id` and confirming every one of them is a plain `404`
+(the route simply doesn't exist), with the payment's actual status in the database unchanged.
+
+A booking's admin-facing `paymentStatus` (`SUCCEEDED`/one of the other payment states/`NONE`) is a
+**derived** value, not a column — computed from a booking's own payment attempt rows by
+`derivePaymentStatusForBooking` (`apps/api/src/lib/admin.ts`): the `SUCCEEDED` attempt if one exists,
+otherwise the most recently updated attempt's status, otherwise `NONE` if payment was never
+attempted at all. Filtering the booking list by `paymentStatus` can't be pushed into the same single
+indexed SQL query the other filters use (there's no `payment_status` column on `bookings` to filter
+on), so that one filter path computes the derived status in application code over a bounded candidate
+set (capped at `PAYMENT_STATUS_FILTER_CANDIDATE_CAP = 1000` rows) rather than the database — a
+documented, deliberate simplification appropriate to an admin tool's scale, not a claim this
+approach scales to an unbounded dataset (see the comment on that code path in
+`apps/api/src/routes/admin/bookings.ts`).
+
+`providerPaymentId` is exposed in the admin payment view (`adminPaymentSchema`) even though the
+customer-facing `publicPaymentSchema` deliberately omits it — judged safe for operational visibility
+because it's a correlation id, never a credential, signature, or secret (see Payments, above, for why
+it's hidden from customers: it's provider-implementation-specific, not because it's sensitive).
+Webhook secrets, signatures, and raw webhook payloads are never returned by any endpoint, admin or
+otherwise.
+
+### Review moderation
+
+`GET /api/admin/reviews` sees reviews of **every** status (`PUBLISHED` and `HIDDEN`), unlike the
+public provider review list, which only ever shows `PUBLISHED` ones — an admin specifically needs to
+find a `HIDDEN` review to republish it. `POST /api/admin/reviews/:id/hide` and
+`POST /api/admin/reviews/:id/publish` are the only two review mutations this route group offers, each
+using the exact same locked-transaction-plus-audit-event pattern as the provider-status endpoint
+(`SELECT ... FOR UPDATE`, then update `reviews.status`, then insert an `ADMIN_REVIEW_HIDDEN` or
+`ADMIN_REVIEW_PUBLISHED` audit event with `metadata: {previousStatus}` — never the review's actual
+`rating`/`title`/`comment`). Hiding an already-hidden review (or publishing an already-published one)
+is a clean `409`, not a silent no-op and not a duplicate audit event.
+
+No one but an admin can reach either action. The reviewing customer's own
+`PATCH /api/reviews/:id` (see Reviews & ratings, above) can amend `rating`/`title`/`comment` but has
+no `status` field at all — a customer cannot hide or publish their own review through any endpoint,
+let alone someone else's. A provider — even the one the review is about — has no path to either
+action either.
+
+### Audit log viewer
+
+`GET /api/admin/audit` reads from the **same** `audit_logs` table the medical-records milestone
+introduced — there is no second, admin-specific audit mechanism. It is read-only: there is no
+`PATCH`/`DELETE` route for an individual audit entry anywhere in this codebase, for any actor,
+including an admin (proven directly in `admin-security.test.ts`) — audit logs remain append-only and
+tamper-proof exactly as originally documented in Medical records, above, and every new
+admin-generated event (`PROVIDER_STATUS_CHANGED`, `ADMIN_REVIEW_HIDDEN`, `ADMIN_REVIEW_PUBLISHED`)
+is subject to that same invariant.
+
+This endpoint deliberately surfaces **every** action value, including the medical-records ones
+(`MEDICAL_RECORD_CREATED`/`VIEWED`/`UPDATED`/`ARCHIVED`). This is not a carve-out of the
+medical-record boundary described below — an audit row's `metadata` never carries clinical content
+in the first place (enforced where those rows are written, in `routes/medical-records.ts`, not
+re-validated here), so what this endpoint reveals is that an access happened, by whom, and when —
+the entire point of an audit trail — never what was actually recorded or viewed. Proven directly in
+`admin-security.test.ts`: a medical record is created with a deliberately distinctive
+title/diagnosis, and the resulting `MEDICAL_RECORD_CREATED` entry, read back through
+`/api/admin/audit`, is asserted to never contain that title or diagnosis text anywhere in its
+`metadata`.
+
+`actorName` is the one place in the entire admin surface that shows a full, un-minimized account
+name (resolved server-side via a batch join, never client-supplied) — a deliberate, narrow exception
+to the data-minimization stance everywhere else in this milestone, because attributing an audit
+event to a real actor is the entire point of an audit trail, not an incidental detail to hide.
+
+### Medical-record isolation — the hardest boundary to get right
+
+**Admin operational access does not imply medical-record access.** There is no
+`/api/admin/medical-records` route, no `/api/admin/pets` route, and no other admin endpoint anywhere
+in this codebase that returns a medical record's `title`, `description`, `details`, or any other
+clinical field. An admin who has never legitimately treated a pet (no provider relationship, per the
+medical-records milestone's own authorization model) still gets a plain `404` from the *existing*
+`GET /api/pets/:petId/medical-records` endpoint — being `ADMIN` grants no special bypass there either
+(a deliberate decision already made in the medical-records milestone, re-verified here rather than
+re-litigated: `admin-security.test.ts`'s "an admin who never treated a pet still cannot read its
+medical records through the existing medical-records API"). If a future milestone ever needs
+operational medical-record access for a genuine support case, the milestone brief is explicit that
+it "should have a dedicated audited workflow" of its own — not a side effect of general admin
+privilege, and not implemented here.
+
+### Frontend
+
+`apps/web/src/features/admin/{api,hooks,components}` follows the same shape every other feature
+does — `api.ts` calls the single centralized Ky client, nothing outside it constructs an HTTP
+request. `apps/web/src/routes/_authenticated/admin/route.tsx` is a pathless-adjacent layout (an
+actual `/admin` URL prefix, unlike `_authenticated` itself) whose `beforeLoad` redirects anything but
+`role === "ADMIN"` straight to `/dashboard` before any child route renders, with a small local nav
+(Dashboard/Providers/Users/Bookings/Payments/Reviews/Audit Log — deliberately no "Medical Records"
+entry, matching the boundary above). The dashboard's own "Admin" link
+(`apps/web/src/routes/_authenticated/dashboard.tsx`) only renders for `role === "ADMIN"` — again, UX
+convenience, not the actual security boundary, which lives entirely server-side as described above.
+
+### Known limitations
+
+- **No role-change endpoint.** Promoting/demoting a user is a direct-database operation only — see
+  "The admin role and its provisioning," above. A future milestone wanting self-service admin
+  provisioning would need to design that carefully (in particular, preventing an admin from
+  accidentally revoking their own last-admin status, which the milestone brief explicitly flags as a
+  risk to guard against whenever this is built).
+- **No mass-cancellation or refund workflow** for a suspended provider's future bookings — see
+  "Suspension does not touch historical data," above.
+- **The `paymentStatus` booking filter is bounded, not infinitely scalable** — see "Booking and
+  payment visibility," above. Fine for this milestone's admin-tool scale; would need a proper
+  SQL-level derivation (a materialized column, or a correlated subquery) at real production booking
+  volume.
+- **No dedicated payment-reconciliation workflow.** The milestone brief explicitly defers this
+  ("if an operational correction is eventually needed, that belongs in a separately designed
+  reconciliation workflow. Do not implement that now.") — this admin surface is visibility-only for
+  payments, by design, not a stopgap reconciliation tool.

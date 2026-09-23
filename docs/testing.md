@@ -324,6 +324,99 @@ same load). `reviews.spec.ts`'s setup helper asserts the terminal `booking-confi
 directly instead of the intermediate one, which is an equally reliable signal (never reached on a
 failed/pending payment — see `payments.spec.ts`) without depending on that race's timing.
 
+### 11. Admin tests (`apps/api/src/admin.test.ts`, `apps/api/src/admin-security.test.ts`)
+
+Same two-file split as medical records and reviews, for the same reason — authorization is the
+entire point of this milestone, not a secondary property of a CRUD surface.
+
+- **`admin.test.ts`** — operational correctness: the dashboard's counts are asserted as deltas (`>=
+  before + N`, not exact equality — see the note on shared-database parallelism below) after
+  creating known providers/bookings/payments, including a dedicated case proving a suspended
+  provider is reflected in `suspendedProviders`; the admin provider list sees an `INACTIVE` provider
+  public discovery no longer shows, filterable by `status` and searchable by business name; provider
+  status changes write a `PROVIDER_STATUS_CHANGED` audit event with the correct
+  `previousStatus`/`newStatus`, and mass-assignment of `ownerId`/`createdAt`/an invented
+  `internalRole` field is silently ignored; a full suspend-then-verify block confirms a `COMPLETED`
+  booking, its payment, and its review are all still present and unchanged after the provider that
+  fulfilled them is suspended, that the suspended provider can no longer accept a new booking
+  (`409`, via the pre-existing booking-creation check — no new logic needed), and that the owner
+  still cannot unsuspend themselves (the pre-existing `assertStatusTransitionAllowed` rule, now
+  exercised via the new admin endpoint too); the user list is asserted to expose *exactly*
+  `id`/`name`/`role`/`createdAt` and nothing else (an object-keys equality check, not just "no email
+  field present" — this would also catch an accidentally-added new field); the booking list resolves
+  customer/provider names and a correctly-derived `paymentStatus` (including `NONE` for a booking
+  with no payment attempt at all), filterable by status/provider/date-range/payment-status; the
+  payment list exposes `providerPaymentId`, which the customer-facing payment endpoint proves (in
+  the same test) it does not; review moderation round-trips hide → not public → publish → public
+  again with matching `ADMIN_REVIEW_HIDDEN`/`ADMIN_REVIEW_PUBLISHED` audit events whose metadata
+  never contains the review's actual content, and hiding an already-hidden review is a clean `409`,
+  not a duplicate audit event; the audit list resolves a human-readable `actorName` and is filterable
+  by action/resourceType.
+- **`admin-security.test.ts`** — the mandatory authorization matrix, generated once as a loop over
+  every `/api/admin/*` route group (`dashboard`/`providers`/`users`/`bookings`/`payments`/`reviews`/
+  `audit`) asserting anonymous → `401`, customer → `403`, a provider-business-owner (still not an
+  `ADMIN` — this codebase's `role` field doesn't grant provider status, ownership of a `providers`
+  row does) → `403`, admin → `200` for every one of them, plus dedicated tests for the two mutation
+  endpoints (provider status change, review hide) proving the same three non-admin actors are denied
+  there too; a role forged in a request body field or an `X-User-Role` header is proven to change
+  nothing (the provider's status stays `ACTIVE` and the request still gets `403`); audit-log
+  immutability is re-proven specifically through the admin surface (`PATCH`/`DELETE` on
+  `/api/admin/audit/:id` are both `404` — the route doesn't exist — even for an authenticated admin);
+  a dedicated `describe` block re-verifies the medical-record boundary from three angles (no
+  `/api/admin/medical-records` route, no alternate admin path that lists records, and an admin
+  without a treating relationship still can't read a specific pet's records through the *existing*
+  medical-records API) plus a content-leak check reading a real `MEDICAL_RECORD_CREATED` audit entry
+  back through `/api/admin/audit` and asserting the record's actual title/diagnosis text never
+  appears in it; filter/search hardening covers a SQL-injection-shaped search string (treated as an
+  inert literal, never breaks the query or leaks extra rows), a malformed UUID/date filter (`400`,
+  not a raw database error), an oversized search string (`400`, not silently truncated), and an
+  absurd `pageSize` (silently clamped to the schema's own bound, same `.catch()` pattern every other
+  paginated endpoint in this codebase already uses — never passed through raw to the database); and
+  a final block proves there is no way to set a payment's status through any HTTP method on
+  `/api/admin/payments/:id`.
+
+A note on the dashboard's delta-based assertions: this codebase's full test suite runs multiple
+files with genuine concurrency against one shared Postgres database (see the `playwright.config.ts`
+note on the same phenomenon at the E2E layer), so a dashboard test comparing global counts
+before/after its own action can't assert exact equality without risking a false failure from another
+test file's concurrent activity landing in the same window — these assertions use `>=` specifically
+to stay meaningful (the dashboard genuinely is a live query, not a cached/hard-coded number) without
+being flaky under real parallel execution.
+
+### 12. Admin Playwright specs (`e2e/admin.spec.ts`)
+
+Three full real-browser workflows. Since there is no API path to become an admin (by design — see
+docs/architecture.md), `e2e/db.ts`'s `promoteToAdminByEmail` connects directly to the same Postgres
+instance the dev API server uses (via plain `pg`, mirroring `test-helpers.ts`'s own `promoteToAdmin`
+for the backend suite) immediately after a fresh registration, then reloads the page so the next
+request re-resolves the now-`ADMIN` role from the database rather than trusting anything cached
+client-side.
+
+- **Provider suspension workflow**: admin dashboard shows live counts; the providers page finds a
+  freshly-created provider by search, suspends it (accepting the confirmation dialog, same pattern
+  `bookings.spec.ts`'s cancel flow already uses) and sees it update to `SUSPENDED` in place; the
+  dashboard's `activeProviders` count doesn't increase across the action; the audit log page shows
+  the resulting `PROVIDER_STATUS_CHANGED` entry; and — the actual point of the whole feature — a
+  customer visiting that provider's now-suspended public page gets the same "provider not found" a
+  nonexistent provider would, proving suspension's effect through the real customer-facing UI, not
+  just the admin panel's own claim that it worked.
+- **Review moderation workflow**: a full provider+booking+completion+review setup (reusing the same
+  building blocks `reviews.spec.ts` established) produces a real, publicly-visible review; the admin
+  hides it, the customer reloads the provider page and it's gone; the audit log shows
+  `ADMIN_REVIEW_HIDDEN`; the admin republishes it from the same (deliberately unfiltered) list view,
+  the customer reloads and sees it again; the audit log shows `ADMIN_REVIEW_PUBLISHED`. This spec
+  intentionally avoids interacting with the status-filter dropdowns mid-workflow — filtering
+  correctness is already proven at the API layer, and toggling a filter, then acting on a row, then
+  expecting that same row to still be present under a filter it no longer matches is a self-inflicted
+  race, not a real product behavior worth chasing in a UI test.
+- **Admin security workflow**: a customer navigating to `/admin` is redirected to `/dashboard` and
+  never sees an "Admin" nav link at all; a `page.request.get(...)` straight at
+  `/api/admin/providers` with that same customer's session gets `403`. A provider-business-owner
+  (who creates a real provider first, to prove owning a business still isn't enough) is redirected
+  from `/admin` the same way, and a direct call to `/api/admin/audit` with their session also gets
+  `403`. Both of these prove the server-side gate independently of whatever the frontend does —
+  exactly the "direct API security must also be tested" requirement the milestone brief calls for.
+
 ## What "passing" actually means here
 
 Every milestone's final verification runs the *entire* existing suite, not just the new resource's

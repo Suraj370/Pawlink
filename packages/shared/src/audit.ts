@@ -11,6 +11,13 @@ export const AUDIT_ACTION_VALUES = [
   "MEDICAL_RECORD_UPDATED",
   "MEDICAL_RECORD_ARCHIVED",
   "AUTHORIZATION_DENIED",
+  // Admin/operations actions (see docs/architecture.md, "Admin &
+  // operations") — reuse this SAME append-only table rather than a
+  // second admin-only audit mechanism; the admin audit viewer
+  // (GET /api/admin/audit) reads every action value, not just these.
+  "PROVIDER_STATUS_CHANGED",
+  "ADMIN_REVIEW_HIDDEN",
+  "ADMIN_REVIEW_PUBLISHED",
 ] as const;
 export const auditActionSchema = z.enum(AUDIT_ACTION_VALUES);
 export type AuditAction = z.infer<typeof auditActionSchema>;

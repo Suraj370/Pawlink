@@ -39,6 +39,11 @@ function DashboardPage() {
       <Link to="/bookings" className="text-sm underline underline-offset-4 w-fit">
         My Bookings
       </Link>
+      {user?.role === "ADMIN" && (
+        <Link to="/admin" className="text-sm underline underline-offset-4 w-fit" data-testid="admin-nav-link">
+          Admin
+        </Link>
+      )}
       <Button onClick={handleLogout} isDisabled={logout.isPending} className="w-fit">
         {logout.isPending ? "Logging out…" : "Log out"}
       </Button>

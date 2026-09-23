@@ -45,3 +45,37 @@ export function createRequireAuth(db: DbClient, nodeEnv: string): MiddlewareHand
     await next();
   };
 }
+
+// The one reusable authorization gate every /api/admin/* route goes
+// through — see docs/architecture.md, "Admin & operations." Layers on
+// top of createRequireAuth (so an unauthenticated caller still gets 401,
+// never a misleading "forbidden"): once authenticated, anything but
+// role === "ADMIN" gets a plain 403. Unlike the pets/bookings/medical-
+// records/reviews convention of hiding a resource's existence behind a
+// 404, there is nothing to hide here — the /api/admin/* namespace's
+// existence is not a secret, only who may use it is gated, so a normal
+// 403 "Forbidden" is the right, unambiguous response for every
+// non-admin caller, authenticated or not.
+//
+// The admin role itself comes from the authenticated user's own trusted
+// session-derived row (resolveUser -> toPublicUser -> users.role),
+// never a client-supplied header, body field, query parameter, or
+// frontend flag — there is no code path anywhere that lets a request
+// claim ADMIN for itself.
+export function createRequireAdmin(db: DbClient, nodeEnv: string): MiddlewareHandler<AppEnv> {
+  return async (c, next) => {
+    const token = getCookie(c, SESSION_COOKIE_NAME);
+    const user = await resolveUser(db, token);
+
+    if (!user) {
+      deleteCookie(c, SESSION_COOKIE_NAME, sessionCookieOptions(nodeEnv));
+      return c.json({ error: "Unauthorized" }, 401);
+    }
+    if (user.role !== "ADMIN") {
+      return c.json({ error: "Forbidden" }, 403);
+    }
+
+    c.set("user", user);
+    await next();
+  };
+}

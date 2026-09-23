@@ -4,7 +4,8 @@ A multi-sided pet-care platform connecting pet parents, vets, groomers, boarding
 platform administrators. This repository currently implements the project foundation,
 authentication, pet management, provider management, service management, availability management,
 the booking engine, a payment abstraction with a deterministic mock provider, a secure, audited
-medical-records system, and provider reviews & ratings earned through a completed booking — no other
+medical-records system, provider reviews & ratings earned through a completed booking, and an
+admin/operations layer for operational visibility and carefully scoped platform actions — no other
 business features are implemented yet.
 
 ## Stack
@@ -38,10 +39,10 @@ Full setup details, environment variables, and prerequisites live in
 
 ```text
 apps/
-  api/      Hono API service (health check, auth, pets, providers, services, availability, bookings, payments, medical records, reviews)
+  api/      Hono API service (health check, auth, pets, providers, services, availability, bookings, payments, medical records, reviews, admin)
   web/      React/Vite frontend (TanStack Router/Query, Ky, shadcn/Tailwind UI)
 packages/
-  shared/   Shared types & Zod schemas (health, auth, pets, providers, services, availability, bookings, payments, medical records, audit, reviews)
+  shared/   Shared types & Zod schemas (health, auth, pets, providers, services, availability, bookings, payments, medical records, audit, reviews, admin)
 e2e/        Playwright end-to-end tests
 docs/       Project documentation
 ```
@@ -67,6 +68,7 @@ and what each layer of the test suite covers.
 | Payments       | `POST/GET /api/bookings/:bookingId/payment`, `GET /api/payments/:id`, `POST /api/payments/webhook` | authenticated (webhook: signature-verified, not session) |
 | Medical records | `GET/POST /api/pets/:petId/medical-records`, `GET/PATCH /api/medical-records/:id`, `POST /api/medical-records/:id/archive` | pet owner (read) / treating provider (read+write) — see below |
 | Reviews         | `GET/POST /api/bookings/:bookingId/review`, `PATCH /api/reviews/:id`, `GET /api/providers/:providerId/reviews` | booking's own customer (write) / public (provider list) — see below |
+| Admin           | `GET /api/admin/{dashboard,providers,users,bookings,payments,reviews,audit}`, `POST /api/admin/providers/:id/status`, `POST /api/admin/reviews/:id/{hide,publish}` | `ADMIN` role only — see below |
 
 Every mutating endpoint derives ownership from the authenticated session, never from a
 client-supplied id. Full request/response shapes and the authorization model are documented in
@@ -147,6 +149,21 @@ client-supplied id. Full request/response shapes and the authorization model are
   (`GET /api/providers/:providerId/reviews`, also folded into every provider response), computed
   fresh from the `reviews` table — never a cached column. See
   [docs/architecture.md](docs/architecture.md), "Reviews & ratings," for the full model.
+
+- **Admin & operations**: an `ADMIN` account (an existing role — provisioned only through a
+  controlled database mechanism, never through any API) gets operational visibility across every
+  customer, provider, booking, payment, and review — dashboard aggregate counts, searchable/
+  filterable lists, and two carefully scoped mutations: changing a provider's status
+  (`POST /api/admin/providers/:id/status`, ACTIVE/INACTIVE/SUSPENDED, transactionally audited) and
+  moderating a review's visibility (`POST /api/admin/reviews/:id/hide` or `/publish`, also audited).
+  Every `/api/admin/*` route independently enforces the `ADMIN` role server-side
+  (`createRequireAdmin`) — frontend route protection is UX only. Payment state can never be manually
+  set through this surface, and **admin operational access does not extend to medical records**:
+  there is no `/api/admin/medical-records` route and no other admin endpoint returns clinical
+  content — the admin audit viewer shows that a medical-record action happened (actor, timestamp,
+  resource id) but never its content, exactly like every other audit event in this codebase. See
+  [docs/architecture.md](docs/architecture.md), "Admin & operations," for the full authorization
+  model, the deliberate provider-suspension/historical-data policy, and the medical-record boundary.
 
 Other product features (refunds, payouts, subscriptions, wallets, notifications, AI) are not
 implemented yet and are separate milestones.

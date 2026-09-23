@@ -71,6 +71,13 @@
       "when": 1790149129147,
       "tag": "0009_chunky_killer_shrike",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1790152377428,
+      "tag": "0010_dashing_sue_storm",
+      "breakpoints": true
     }
   ]
 }
