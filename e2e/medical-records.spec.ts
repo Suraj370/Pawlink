@@ -75,7 +75,7 @@ async function setupConfirmedBooking(
   const paymentPanel = customerPage.getByTestId("payment-panel");
   await expect(paymentPanel).toBeVisible();
   await paymentPanel.getByTestId("pay-success-button").click();
-  await expect(paymentPanel.getByTestId("payment-status-succeeded")).toBeVisible();
+  await expect(paymentPanel.getByTestId("payment-status-succeeded")).toBeVisible({ timeout: 15_000 });
   await expect(customerPage.getByTestId("booking-confirmation")).toBeVisible();
 
   return { owner, businessName, providerUrl, customer, petUrl };

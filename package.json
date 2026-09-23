@@ -14,6 +14,7 @@
     "dev:web": "npm run dev --workspace apps/web",
     "build": "npm run build --workspace packages/shared && npm run build --workspace apps/api && npm run build --workspace apps/web",
     "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint .",
     "test": "npm run test --workspace apps/api",
     "test:e2e": "playwright test",
     "db:up": "docker compose up -d postgres",
@@ -23,7 +24,11 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.47.0",
-    "typescript": "^5.6.2"
+    "eslint": "^9.39.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.7",
+    "typescript": "^5.6.2",
+    "typescript-eslint": "^8.70.1"
   },
   "engines": {
     "node": ">=20"

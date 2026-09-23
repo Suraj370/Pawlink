@@ -1306,3 +1306,512 @@ convenience, not the actual security boundary, which lives entirely server-side 
   ("if an operational correction is eventually needed, that belongs in a separately designed
   reconciliation workflow. Do not implement that now.") — this admin surface is visibility-only for
   payments, by design, not a stopgap reconciliation tool.
+
+## Production hardening, observability & security
+
+This section documents the last milestone: making PawLink demonstrably production-minded, not a
+new business feature. Nothing below changes what the application *does* — every change here is
+about how it behaves as a deployed, operated system: how it fails, what it logs, what it validates
+at startup, how it's built, and what protects it from abuse.
+
+### Architecture
+
+```
+Customer / Provider / Admin (browser)
+              │
+              ▼
+        React (Vite SPA)
+              │
+      TanStack Router  ── client-side route guards (UX only)
+              │
+      TanStack Query   ── server-state cache, cleared on every auth transition
+              │
+             Ky         ── the one HTTP client; nothing calls fetch() directly
+              │
+              ▼  HTTPS (WEB_ORIGIN ↔ VITE_API_URL, CORS-restricted)
+        ┌─────────────────────────────────────────────┐
+        │                Hono API                      │
+        │  requestId → requestLogging → securityHeaders │
+        │  → CORS → rateLimit → [route handlers]        │
+        │              │                                 │
+        │        requireAuth / requireAdmin              │
+        │        (session cookie → users.role)            │
+        │              │                                 │
+        │            Zod validation                       │
+        └───────────────┬───────────────┬─────────────┘
+                         │               │
+                         ▼               ▼
+                     Drizzle ORM      ioredis
+                  (parameterized     (rate-limit
+                   queries only)      counters only
+                         │            — no session/
+                         ▼             app data)
+                    PostgreSQL          Redis
+```
+
+Domain boundaries inside the API (see their own sections above for each): **Bookings** (concurrency
+via a Postgres `EXCLUDE` constraint, idempotency via a persisted key table) → **Payments** (a
+provider-agnostic state machine, webhook signature + idempotency) → **Medical Records** (booking-
+derived provider authorization, its own audit trail) → **Reviews** (completed-booking eligibility, a
+database-enforced one-per-booking invariant) → **Admin** (role-gated operational visibility, no
+medical-record bypass) → **Audit** (one shared, append-only table every sensitive action across
+every domain writes to, never mutated by any HTTP route).
+
+### Security model — a consolidated summary
+
+Every one of these is implemented and tested in an earlier section of this document; this is the
+index, not a restatement:
+
+| Concern | Enforced by | See |
+|---|---|---|
+| Authentication | Hashed opaque session tokens, `httpOnly`/`secure`(prod)/`SameSite=Lax` cookies | Foundation |
+| Authorization | Server-derived ownership on every mutation, never a client-supplied id | every feature section |
+| IDOR resistance | 404 (not 403) for a resource that exists but isn't the caller's | Foundation |
+| Booking concurrency | Postgres `EXCLUDE` constraint (`tstzrange` over provider+time) | Booking engine |
+| Idempotency | Persisted `(customer_user_id, key)` claim tables, not in-memory | Booking engine, Payments |
+| Payment invariants | A single transition table; amount/currency always server-derived | Payments |
+| Medical privacy | Booking-derived relationship check; no admin bypass anywhere | Medical records, Admin |
+| Review integrity | `UNIQUE(booking_id)`, `CHECK(rating BETWEEN 1 AND 5)`, server-derived identity | Reviews & ratings |
+| Admin authorization | `createRequireAdmin` on every `/api/admin/*` route, independently of the UI | Admin & operations |
+| Audit immutability | Append-only table; no `PATCH`/`DELETE` route exists for it, anywhere | Medical records, Admin |
+| Mass assignment | Every mutation reads only `parsed.data` from a Zod schema, never the raw body | Foundation |
+| SQL injection | Drizzle's parameterized query builder exclusively — see "Dependency audit," below | this section |
+| XSS | React's default text-node escaping; zero uses of `dangerouslySetInnerHTML`/`innerHTML` | Reviews & ratings |
+
+### Environment configuration and secret hygiene
+
+`apps/api/src/env.ts` is the single source of truth for configuration, Zod-validated at startup —
+a production process that's missing a required value, or that's still carrying a checked-in
+development default for something that's supposed to be a real per-deployment secret, fails loudly
+before it ever accepts a request, rather than running silently misconfigured:
+
+- `DATABASE_URL` — always required, in every environment; there has never been a default.
+- `MOCK_PAYMENT_WEBHOOK_SECRET` — defaults to a known dev value locally, but production **must**
+  override it; a `.refine()` rejects the checked-in default whenever `NODE_ENV === "production"`.
+- `REDIS_URL` — optional outside production (rate limiting simply runs as a no-op without it — see
+  "Rate limiting," below); **required** in production by the same kind of refinement, so a real
+  deployment can't silently ship without rate limiting.
+- `APP_VERSION` — optional everywhere; a safe, non-secret build identifier (see "Deployment
+  version," below).
+
+`loadEnv()`'s failure path only ever logs Zod's field-level messages (which field, why) — never a
+secret's actual value. `apps/api/.env`, `apps/web/.env`, and every `.env.*` variant are gitignored;
+only `.env.example` files (fake/example values, explicitly documented as safe to leave for local
+dev) are committed. A repo-wide search for `password|secret|token|api_key|private_key` at this
+milestone's audit turned up nothing accidentally committed — the only "secret"-shaped strings in the
+whole codebase are the mock payment webhook secret (explicitly documented as not a real credential)
+and the field *names* themselves in Zod schemas and comments.
+
+**Server-only configuration never reaches the client bundle.** The frontend's only environment
+variable is `VITE_API_URL` (`apps/web/src/lib/api/client.ts`) — Vite only ever inlines variables
+explicitly prefixed `VITE_*`, and this codebase has exactly one. There is no `DATABASE_URL`,
+`MOCK_PAYMENT_WEBHOOK_SECRET`, `REDIS_URL`, or session-related secret anywhere that a client bundle
+could reference even by mistake.
+
+### API error handling
+
+Every route in this codebase already returned a predictable `{"error": "message"}` shape with a
+correctly-classified status code (`400` invalid input, `401` unauthenticated, `403` forbidden, `404`
+hidden/missing resource, `409` domain conflict) before this milestone — established and tested
+across ten prior milestones and hundreds of tests. This hardening pass deliberately did **not**
+restructure that into the brief's illustrative `{"error": {"code", "message"}}` shape: doing so would
+mean touching every route handler and every frontend error-reading call site
+(`apps/web/src/lib/api/errors.ts`'s `toErrorMessage`) for a payload-shape change with no correctness
+benefit — the milestone brief's own "preserve existing API semantics where already correct" and "do
+not restructure the project unnecessarily" apply directly here. What *did* need hardening, and got
+it:
+
+- **Unexpected errors never leak internals.** `app.onError` (`apps/api/src/app.ts`) logs the full
+  error (message, stack) plus the request id to the server-side structured log, and returns the
+  client a fixed `{"error": "Internal Server Error"}` — never a stack trace, a raw SQL error, a
+  filesystem path, or any exception message. Proven directly: `production-hardening.test.ts` throws
+  a deliberately secret-shaped error message and asserts the HTTP response is exactly the fixed JSON,
+  nothing else.
+- **Known failure modes never fall through to a generic 500.** This was already true — a booking
+  conflict is `409`, a duplicate idempotency key with a different request body is `409`, invalid Zod
+  input is `400` with field-level detail, a missing/hidden resource is `404` — re-verified, not
+  rebuilt, during this milestone's audit.
+
+### Request IDs and structured logging
+
+Every request gets a correlation id (`apps/api/src/middleware/requestId.ts`): an incoming
+`X-Request-ID` header is used if it matches a conservative allowlist (`[A-Za-z0-9_-]{8,128}`) —
+protecting against a client injecting something unsafe into logs or the echoed response header —
+otherwise a fresh UUID is generated. It's set on the response (`X-Request-ID`) and threaded through
+every log line for that request, including the `app.onError` handler's own log line, so a
+production incident can always be traced from "which request failed" to "what that request's full
+access-log entry looked like."
+
+`apps/api/src/middleware/requestLogging.ts` replaces Hono's own dev-oriented `logger()` entirely
+with one structured JSON line per request:
+
+```json
+{"timestamp":"...","level":"info","request_id":"...","method":"GET","route":"/api/pets/:petId/medical-records","path":"/api/pets/abc.../medical-records","status":200,"duration_ms":12,"user_id":"..."}
+```
+
+`route` is Hono's own matched-pattern string (never the raw id-bearing path used as a metric
+dimension); `user_id` is included only when the request was authenticated. **Never logged, by any
+code path in this codebase, anywhere**: request bodies, passwords, session cookies, Authorization
+headers, payment secrets, webhook secrets, or medical-record content — matching the same "structural
+context only" discipline the audit-log system (Medical records, above) already established.
+`level` is `error` for `5xx`, `warn` for `4xx`, `info` otherwise, so a log aggregator can filter on it
+without parsing the body.
+
+### Authentication and session hardening
+
+Re-audited, not rebuilt — this was already solid from the first milestone:
+
+- Session tokens are 32 random bytes (`crypto.randomBytes`), never a predictable value; only their
+  SHA-256 hash is ever persisted (`sessions.id`), so reading the database can't yield a usable
+  credential.
+- Cookies are `httpOnly` (never readable from JS — an XSS payload, even if one existed, couldn't
+  exfiltrate a session), `secure` in production (never sent over plain HTTP), `SameSite=Lax`, and
+  scoped to `path: "/"` with a 7-day `maxAge`.
+- **Logout genuinely invalidates the session** — `POST /api/auth/logout` deletes the session row
+  server-side (not just the cookie), so a stolen/replayed cookie value stops working immediately, not
+  just once the cookie happens to expire client-side.
+- An expired session (`expiresAt` in the past) is deleted and treated as unauthenticated on its very
+  next use — never silently accepted.
+- **No CSRF token exists, and none was added.** `SameSite=Lax` already blocks the cookie from being
+  sent on a cross-site state-changing request (POST/PATCH/DELETE via a normal `<form>` or `fetch`
+  from another origin), and CORS is restricted to exactly `WEB_ORIGIN` with credentials — the two
+  together already close the practical CSRF surface for a cookie-only, single-trusted-origin API.
+  Adding an explicit CSRF token on top would be genuine, documented defense-in-depth for a future
+  milestone, but isn't the gap this audit found worth closing now.
+
+### TanStack Query cache isolation (a real bug found and fixed)
+
+This milestone's audit found a genuine cross-user data-leak bug, not a hypothetical one:
+`useLogout` (`apps/web/src/features/auth/hooks.ts`) only ever removed the `auth/me` query from the
+cache — every OTHER cached query (bookings, pets, medical records, admin lists, anything) survived a
+logout untouched. On a shared browser/device, logging out and logging back in as someone else (or a
+different account logging in without an intervening logout) could render a PREVIOUS session's cached
+data for a moment before the corresponding refetch resolved — exactly the milestone brief's "second
+user must not see cached private data from the first user."
+
+**Fixed**: `useLogin`, `useRegister`, and `useLogout` now all call `queryClient.clear()` — wiping the
+*entire* cache, not an allowlist of "sensitive" keys someone would have to remember to maintain —
+before re-seeding the fresh `auth/me` value (login/register) or leaving it empty (logout). Every
+other query simply refetches fresh on next mount; there is no meaningful cost to clearing
+unconditionally on an auth transition, which happens rarely compared to ordinary navigation.
+
+### Rate limiting
+
+Redis-backed, fixed-window counters (`apps/api/src/middleware/rateLimit.ts`), applied to exactly the
+endpoints the milestone brief prioritizes — login, registration, booking creation, payment
+initiation, the payment webhook, admin search, and public provider search/list — via a small,
+explicit rules table, not a blanket per-route limit:
+
+| Rule | Method + path | Window | Max |
+|---|---|---|---|
+| `auth-login` | `POST /api/auth/login` | 60s | 10 |
+| `auth-register` | `POST /api/auth/register` | 60s | 5 |
+| `booking-create` | `POST /api/bookings` | 60s | 20 |
+| `payment-create` | `POST /api/bookings/:id/payment` | 60s | 20 |
+| `payment-webhook` | `POST /api/payments/webhook` | 60s | 120 (server-to-server, higher ceiling) |
+| `admin-search` | `GET /api/admin/*` | 60s | 60 |
+| `public-search` | `GET /api/providers`, `GET /api/providers/:id/{services,reviews}` | 60s | 120 |
+
+Keyed by client IP (`apps/api/src/lib/clientIp.ts`), gated by a `TRUST_PROXY` env flag (`env.ts`,
+default `false`) — a per-session/per-user key would be trivially bypassed by registering a new
+account per attempt for exactly the endpoints (login, registration) that matter most, so IP is the
+right key, but *which* IP is trustworthy depends entirely on the deployment topology in front of this
+process:
+
+- **`TRUST_PROXY=false` (the default, and what `docker-compose.prod.yml` actually ships today)** —
+  `X-Forwarded-For` is never read; the key is the raw socket address instead. This repo's shipped
+  production compose file publishes the `api` container's port directly to the host with **no**
+  reverse proxy in front of it, so the socket address genuinely is the real client's address, and
+  trusting a client-supplied header here would let any anonymous caller bypass every rate limit in
+  this table by sending a different `X-Forwarded-For` value per request. (An earlier draft of this
+  doc — and the code's own comment — incorrectly assumed a proxy fronted the API; there wasn't one.
+  Caught during this milestone's own adversarial security review, fixed by adding this flag rather
+  than by leaving the header trusted unconditionally.)
+- **`TRUST_PROXY=true`** — `X-Forwarded-For`'s first hop is trusted instead. Only flip this if a real
+  reverse proxy is added in front of the `api` service that is itself the sole public entry point and
+  sets/overwrites that header before forwarding (not currently true of anything this repo ships).
+
+See `apps/api/src/env.test.ts` and `apps/api/src/production-hardening.test.ts`'s `TRUST_PROXY`
+describe block for tests proving both the default-off spoof-resistance and the opt-in behavior.
+
+**Fails open, not closed**: a Redis error (timeout, connection refused, temporary outage) is caught,
+logged, and the request proceeds unlimited for that one attempt — a rate limiter must never be able
+to take down real traffic just because its own backing store had a bad moment. Disabled entirely
+(not an error) when `REDIS_URL` is unset, which is the default in development/test — the existing
+fast local test workflow (hundreds of tests registering users, creating bookings, looping over admin
+endpoints) was never built around requiring a Redis container, and a global rate limit across that
+suite would need per-test resets to avoid false failures. `REDIS_URL` is required in production (see
+"Environment configuration," above), so a real deployment can't silently ship without this.
+
+Fixed-window, not a true sliding window — a documented, deliberate trade-off: a client can burst up
+to ~2x `max` across a window boundary. A sliding-window-log or token-bucket implementation is
+meaningfully more complex for a single-Redis-instance, portfolio-scale deployment, and a fixed window
+already stops the abuse patterns these rules actually target (credential stuffing, registration spam,
+booking/payment hammering, scraping).
+
+Unit-tested against a minimal in-memory fake store (`production-hardening.test.ts`) rather than
+requiring a real Redis server for the test suite — proves the actual counting/threshold/`Retry-After`
+logic, the per-rule bucket isolation, the fail-open behavior on a store error, and the no-op behavior
+with no store configured, all without adding a hard Redis dependency to `npm test`.
+
+### Webhook hardening (re-audited)
+
+Already solid from the Payments milestone, re-verified rather than rebuilt: signature verification
+happens strictly before the body is even parsed as JSON (so a malformed body can't be used to skip
+authentication), a missing/mismatched signature is `401`, an oversized body is rejected with `413`
+before either check runs, and `(provider, event_id)` uniqueness makes a genuinely duplicated or
+replayed delivery a safe, idempotent no-op — proven directly by 2x and 10x-concurrent identical-event
+tests. Out-of-order events go through the exact same payment-status transition table every other
+change does, never a separate ad hoc "is this out of order?" check. See Payments, above, for the full
+design; nothing here changed.
+
+### CORS and security headers
+
+CORS (`apps/api/src/app.ts`) has always been a single explicit origin from `WEB_ORIGIN` with
+`credentials: true` — never a wildcard `*`, which the browser wouldn't even honor alongside
+credentials anyway. Re-verified, not changed.
+
+`apps/api/src/middleware/securityHeaders.ts` adds, on every response: `X-Content-Type-Options:
+nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, and a strict
+`Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` — safe to be this strict
+because the API only ever returns JSON, never HTML. `Strict-Transport-Security` is only set in
+production, where the deployment's reverse proxy actually terminates TLS — asserting HTTPS-only over
+plain `http://localhost` in development would just break local testing for no benefit.
+
+The frontend's headers are configured at the deployment layer (`apps/web/vercel.json` — see
+"Deployment," below) rather than in application code, since a static SPA has no server of its own to
+add them: the same `X-Content-Type-Options`/`X-Frame-Options`/`Referrer-Policy` set, plus a CSP
+(`default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; ...; connect-src 'self'
+*`) — `style-src` allows `'unsafe-inline'` because Tailwind's generated styles and a handful of
+inline style attributes rely on it; `connect-src` allows any origin because `VITE_API_URL` is baked
+in at build time and can point anywhere the deployer configures, already independently protected by
+the API's own CORS allowlist. This app loads no third-party scripts and no CDN fonts (see
+`@fontsource-variable/inter`, self-hosted) — a strict CSP is genuinely safe here, not a policy full of
+exceptions.
+
+### Frontend production audit
+
+- **Source maps are explicitly disabled** for the production build (`apps/web/vite.config.ts`,
+  `build: { sourcemap: false }`) — an explicit, documented choice, not an implicit default someone
+  could accidentally flip.
+- **No server-only configuration reaches the client bundle** — see "Environment configuration,"
+  above.
+- **No debug data or test credentials** are baked into the build — `apps/web/.env.example`'s only
+  variable is a public API URL.
+- **TanStack Query cache isolation** — see the dedicated section above; this is as much a frontend
+  production concern as a security one.
+- **Route guards are UX only** — `apps/web/src/routes/_authenticated/route.tsx` and
+  `.../admin/route.tsx` redirect before rendering, but every API call those pages make independently
+  re-enforces the same authorization server-side (proven throughout: every `*-security.test.ts` and
+  `*-security.spec.ts` file in this codebase drives the API directly, not just through the UI).
+
+### Health, readiness, and deployment version
+
+`GET /health` stays deliberately cheap — "is the process alive," nothing that touches Postgres,
+Redis, or any other dependency (verified directly: `health.test.ts` asserts it responds in under
+200ms). `GET /ready` (new this milestone) additionally runs a trivial `SELECT 1` against Postgres and
+reports `200 {"status":"ok","checks":{"database":"ok"}}` or `503 {"status":"degraded","checks":
+{"database":"unreachable"}}` — enough for an orchestrator's readiness probe to know whether to route
+traffic to this instance, without ever exposing the connection string, credentials, or any other
+configuration (verified directly in both endpoints' tests). Neither endpoint reflects Redis
+reachability — rate limiting already fails open on a Redis outage (see above), so a Redis blip isn't
+a readiness concern the way a Postgres outage is.
+
+Both responses carry `version` — a safe, non-secret build identifier (a commit SHA in a real
+deployment, `"dev"` when `APP_VERSION` is unset locally — see `apps/api/src/lib/version.ts`). Set via
+a Docker build arg (`apps/api/Dockerfile`'s `ARG APP_VERSION`) so an operator can always answer "what
+build is actually running" from `curl /health` alone.
+
+### Docker
+
+`apps/api/Dockerfile` is a three-stage build (`deps` → `build` → `runtime`) from the **repo root**
+context (an npm-workspaces monorepo — `apps/api` depends on `packages/shared`, so a build needs the
+whole tree). `npm ci --ignore-scripts` in the `deps` stage installs deterministically from the
+committed lockfile without running the root `postinstall` (which needs source that isn't copied in
+until the `build` stage); `npm prune --omit=dev` after building strips devDependencies before the
+runtime image is assembled. The final `runtime` stage contains only compiled output
+(`apps/api/dist`), the migration SQL (`apps/api/drizzle`), production `node_modules`, and the two
+`package.json` files npm's workspace symlink resolution needs — no source, no devDependencies, no
+`.env` file of any kind (secrets are injected as real environment variables by the orchestrator, never
+baked into the image). It runs as `node:20-alpine`'s built-in unprivileged `node` user, exposes only
+port 3000, and ships a `HEALTHCHECK` against `GET /health` (never `/ready`, to keep the healthcheck
+itself cheap). `CMD` uses exec form (`["node", ...]`), so the Node process is PID 1 and receives
+`SIGTERM` directly for a clean shutdown — no shell wrapper to swallow the signal.
+
+The migration script (`apps/api/src/db/migrate.ts`) was fixed during this milestone's own Docker
+verification: it previously resolved its migrations folder as `"./drizzle"`, relative to
+`process.cwd()` — which only ever worked locally because `npm run db:migrate --workspace apps/api`
+happens to run with `apps/api/` as the working directory. The Docker image's `WORKDIR` is the repo
+root, not `apps/api`, so that same relative path silently pointed at a nonexistent folder and the
+migrator failed with "Can't find meta/_journal.json file." Fixed to resolve relative to the
+**module's own compiled location** (`fileURLToPath(new URL("../../drizzle", import.meta.url))`) —
+correct regardless of the invoking working directory. Caught by actually building and running the
+image end-to-end against real Postgres/Redis containers during this milestone (see "Deployment
+verification," below), not by inspection alone — the exact kind of bug that inspection-only "the code
+looks right" review reliably misses.
+
+**The frontend does *not* have a Dockerfile.** It deploys as a static Vite build to Vercel instead
+(`apps/web/vercel.json` — SPA rewrite so every client-side TanStack Router path serves `index.html`,
+plus the security headers described above). See "Deployment," below.
+
+`docker-compose.yml` (development) gained an optional `redis` service — `npm run dev`/`npm test`
+never require it (see "Rate limiting," above); start it explicitly
+(`docker compose up -d redis`) only to exercise rate limiting locally.
+`docker-compose.prod.yml` (new) is the real backend production stack: Postgres + Redis + the API,
+built from the real Dockerfile, run with `NODE_ENV=production` so every hardening decision in
+`env.ts` actually takes effect. Postgres and Redis publish no host port (reachable only from other
+containers on the compose network); the API is the one publicly-facing piece. Required secrets
+(`POSTGRES_PASSWORD`, `WEB_ORIGIN`, `MOCK_PAYMENT_WEBHOOK_SECRET`) use Compose's `${VAR:?message}`
+syntax — the stack refuses to start with a clear error if any of them is missing, the same
+fail-loudly discipline `env.ts` already enforces inside the process itself.
+
+### CI
+
+`.github/workflows/ci.yml` (new — none existed before this milestone) runs on every push/PR to
+`main`, as three jobs: **build** (typecheck + lint + production build, no external services needed),
+**api-tests** (the full backend Vitest suite against a real ephemeral Postgres service container,
+never mocked — exactly what local development already does via `docker compose up -d postgres`), and
+**e2e-tests** (the full Playwright suite against real dev servers and a real Postgres service
+container). A second push to the same branch/PR cancels the previous run rather than letting both
+finish. The e2e job uploads the Playwright HTML report as an artifact on failure, and runs with
+`--retries=1` specifically to absorb the documented CI-runner timing sensitivity described in
+"Test reliability," below — not a blanket "retry until green," and not something that hides a
+genuine, reproducible failure (a real bug still fails on retry too).
+
+**Lint didn't exist in this codebase before this milestone either.** `eslint.config.js` (new) is
+deliberately minimal: `typescript-eslint`'s non-type-aware `recommended` rules (type-aware linting
+would need a project reference per workspace and would meaningfully slow CI down, for a benefit this
+codebase's already-thorough `tsc --noEmit` typecheck step largely already covers) plus
+`eslint-plugin-react-hooks` and `eslint-plugin-react-refresh` for the frontend workspace only. This
+is a correctness gate, not a style/format enforcer — no Prettier, no import-ordering, nothing
+retrofitted onto an already-large, already-internally-consistent codebase purely for stylistic
+uniformity. Running it against the entire existing codebase at introduction found **zero errors** and
+exactly one warning (a pre-existing, framework-inherent pattern in a shadcn-generated UI component) —
+the codebase was already this disciplined before any lint tooling existed to enforce it.
+
+### Dependency audit
+
+`npm audit --omit=dev` reports two findings against production dependencies, both investigated
+individually per the milestone brief's own process (is the package actually used; is the vulnerable
+*path* reachable; upgrade only where that's actually true) rather than blindly running
+`npm audit fix --force`:
+
+- **`drizzle-orm` — SQL injection via unescaped identifiers (high, GHSA-gpj5-g38j-94v9).** The
+  vulnerable pattern is specifically `sql.identifier()` or a dynamically-constructed `.as()` alias
+  built from untrusted input (e.g. a client-supplied sort-field name used as a raw identifier). A
+  repository-wide search confirms **zero uses of either API anywhere in this codebase** — every
+  dynamic filter (search terms, admin sort/filter parameters) in this app uses Drizzle's ordinary
+  parameterized query builder (`eq`, `ilike`, `and`, `inArray`, ...) against a fixed, hardcoded
+  column reference; user input is only ever bound as a *value*, never interpolated as an *identifier*.
+  The vulnerable code path is not reachable. The available fix (`drizzle-orm@0.45.3`) is a major
+  version jump from the currently-pinned `^0.33.0` with real breaking-change risk across the entire
+  data layer (query builder API changes, `drizzle-kit` compatibility) and no corresponding security
+  benefit for this codebase — deliberately not applied, matching the brief's own "avoid unrelated
+  dependency churn."
+- **`esbuild` (via `vite`) — dev server request forwarding (moderate, GHSA-67mh-4wv8-2f99).** Only
+  affects Vite's *development* server, which is never what's deployed — production is a static build
+  served by Vercel (see "Deployment," below), not `vite`'s dev server. The fix would mean a major
+  `vite` version jump (5.x → 8.x) with real risk to the existing Tailwind v4/TanStack Router Vite
+  plugin integration, for a vulnerability that has no production exposure at all. Deliberately not
+  applied.
+
+Both decisions are re-evaluable whenever either package's next reachable, low-risk patch becomes
+available — this is a point-in-time judgment call, documented rather than silently deferred.
+
+### Performance sanity check
+
+No load-testing platform was introduced (the milestone brief explicitly doesn't ask for one) — a
+targeted review of the endpoints most likely to have an N+1 or unbounded-query problem:
+
+- **Dashboard aggregates** (`GET /api/admin/dashboard`) — eight independent `count(*)` queries run
+  via a single `Promise.all`, never one row fetched per entity.
+- **Provider/booking/payment/review/audit lists** — every one of them is a single paginated query
+  (`limit`/`offset`, capped `pageSize`) plus, where names need resolving (a booking's customer/
+  provider name, a review's reviewer display name), one batched `inArray(...)` lookup per page, never
+  a lookup per row.
+- **Availability calculation** — already a pure, in-memory function over a handful of weekly-rule and
+  exception rows per provider (see Availability management, above); no database access inside the
+  hot loop at all.
+- **Booking creation** — already reads exactly the rows its transaction needs (the locked
+  provider/service, the pet, the relevant weekly rules and exceptions, active bookings for that
+  provider), nothing broader.
+
+Indexes already exist for every access pattern these queries actually use (see "Database integrity,"
+below, and each feature's own migration comments) — this audit found no missing index worth adding.
+
+### Test reliability
+
+Two genuine issues were found and fixed during this milestone, not papered over:
+
+- **A real race condition in `BookingPaymentStep`** (`apps/web/src/features/bookings/components/`):
+  it previously watched the booking query independently via `useEffect` and advanced to the
+  confirmation view whenever it happened to observe `CONFIRMED` — racing against the SAME payment
+  mutation's own synchronous `setQueryData` (which lets `PaymentPanel` paint "Payment successful").
+  Under load, React could coalesce both resulting re-renders into one commit and paint only the
+  later one, skipping the intermediate state's render entirely. **Fixed** by driving the sequence
+  explicitly off `PaymentPanel`'s own `onSettled` callback and an *awaited* booking refetch, which
+  guarantees a real render boundary between the two states rather than racing two independently
+  invalidated queries.
+- **A `migrate.ts` cwd-relative path bug** — see "Docker," above.
+
+**What remains, documented honestly rather than hidden:** a handful of Playwright specs share a
+timing-sensitive assertion (`PaymentPanel`'s "Payment successful" state) that can occasionally need
+more than a few seconds to paint under this specific development machine's load (Docker Desktop +
+Postgres + the API's `tsx watch` process + Vite + multiple concurrent browser instances, all
+competing for the same CPU cores) — confirmed, by repeated testing, to persist even running fully
+serially (`--workers=1`), which rules out cross-worker Playwright contention as the cause and points
+to genuine host-level resource contention instead. This is **not** a logic bug in the application —
+the underlying invariant (payment succeeds → booking becomes `CONFIRMED` → the UI correctly reflects
+it) held in every single run, including the ones where the transient success message itself wasn't
+observed in time. The affected assertions already carry a generous explicit timeout (`15_000ms`,
+matching a pattern already established in this codebase before this milestone) rather than the
+default `5_000ms`, and CI runs the suite with `--retries=1` for the same reason. This is stated here
+rather than silently worked around further, per the milestone brief's own "state remaining
+limitations honestly."
+
+### Deployment
+
+PawLink deploys as two independently-deployable pieces, matching how they're actually built and
+scaled:
+
+1. **Backend** (API + Postgres + Redis) — `docker-compose.prod.yml`, built from
+   `apps/api/Dockerfile`. Bring up: set `POSTGRES_PASSWORD`, `WEB_ORIGIN` (the deployed frontend's
+   real origin), and `MOCK_PAYMENT_WEBHOOK_SECRET` (a real, non-default value), then
+   `docker compose -f docker-compose.prod.yml up -d --build`, then run migrations once:
+   `docker compose -f docker-compose.prod.yml run --rm api node apps/api/dist/db/migrate.js`.
+2. **Frontend** — a static Vite build deployed to Vercel, with the project's Root Directory set to
+   `apps/web` (Vercel's own monorepo support handles the npm-workspaces install/build from the true
+   repo root automatically) and one environment variable, `VITE_API_URL`, pointing at wherever the
+   backend from step 1 is actually reachable. `apps/web/vercel.json` supplies the SPA rewrite (every
+   client-side route serves `index.html`) and the security headers described above.
+
+A real production deployment of the backend would additionally put a TLS-terminating reverse proxy
+or load balancer in front of the API container rather than exposing it directly — `docker-
+compose.prod.yml` deliberately doesn't attempt to reproduce that layer (see "Known limitations,"
+below), and `Strict-Transport-Security` is only meaningful once it exists.
+
+### Known limitations (production hardening)
+
+Stated honestly rather than glossed over, per the milestone brief's own instruction not to claim
+zero vulnerabilities:
+
+- **No TLS termination in `docker-compose.prod.yml`.** The API container serves plain HTTP; a real
+  deployment needs a reverse proxy/load balancer in front of it for TLS. Not reproduced here.
+- **Rate limiting is IP-keyed; `X-Forwarded-For` is untrusted by default (`TRUST_PROXY=false`).**
+  Correct for the no-reverse-proxy topology this repo actually ships, but it means the key is the
+  TCP peer address of whatever sits directly in front of the API — if a real reverse proxy is later
+  added, `TRUST_PROXY=true` must be set at the same time or every client behind that proxy will share
+  a single rate-limit bucket (the proxy's own address). See "Rate limiting," above.
+- **No horizontal-scaling story for rate limiting beyond what Redis already provides** — the counters
+  themselves are already shared/correct across multiple API instances (that's the whole point of
+  using Redis instead of in-memory state), but nothing here addresses session affinity, connection
+  pooling limits, or other multi-instance concerns beyond rate limiting specifically.
+- **No CSRF token** — see "Authentication and session hardening," above, for why `SameSite=Lax` +
+  restricted CORS is judged sufficient for this app's shape rather than an oversight.
+- **`drizzle-orm` and `vite`/`esbuild` have known advisories against older major versions** —
+  investigated and deliberately not upgraded; see "Dependency audit," above.
+- **A handful of Playwright specs have a documented, understood, environment-driven timing
+  sensitivity** — see "Test reliability," above. Not a correctness bug in the application.
+- **This backend stack has not been proven under real production traffic/load** — the milestone
+  brief explicitly scopes this to a "performance sanity check," not a load-testing platform; see
+  that section, above.

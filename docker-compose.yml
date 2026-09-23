@@ -17,5 +17,23 @@ services:
       timeout: 5s
       retries: 10
 
+  # Optional — plain `npm run dev:api`/`npm test` never require this
+  # (REDIS_URL is unset by default, and rate limiting simply runs as a
+  # no-op without it — see env.ts). Start it explicitly
+  # (`docker compose up -d redis`) and set REDIS_URL=redis://localhost:6379
+  # in apps/api/.env only when you want to exercise rate limiting
+  # locally. See docker-compose.prod.yml for the real production stack.
+  redis:
+    image: redis:7-alpine
+    container_name: pawlink-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   pgdata:

@@ -417,6 +417,38 @@ client-side.
   `403`. Both of these prove the server-side gate independently of whatever the frontend does —
   exactly the "direct API security must also be tested" requirement the milestone brief calls for.
 
+### 13. Production hardening tests (`apps/api/src/env.test.ts`, `apps/api/src/production-hardening.test.ts`)
+
+- **`env.test.ts`** — `loadEnv()` throws when `DATABASE_URL` is missing; `MOCK_PAYMENT_WEBHOOK_SECRET`
+  defaults outside production but is rejected as the checked-in dev value specifically when
+  `NODE_ENV === "production"`; the same required-in-production pattern for `REDIS_URL`; and a direct
+  proof that a validation failure's console output never contains an actual configured value (a
+  `postgres://...` connection string), only Zod's field-level "what's wrong" messages.
+- **`production-hardening.test.ts`** — request-id generation and the safe-allowlist validation of an
+  incoming `X-Request-ID` (a script-injection-shaped or 10,000-character header value is rejected,
+  never reflected); every security header present on both a normal and an error response, and
+  `Strict-Transport-Security` absent outside production; a deliberately secret-shaped thrown error
+  proven to never appear in the client-visible response body; and the full rate-limiting matrix
+  against a minimal in-memory fake `RateLimitStore` (see docs/architecture.md, "Rate limiting," for
+  why a fake rather than a real Redis server) — disabled with no store configured, exactly `max`
+  requests allowed then a `429` with `Retry-After`, separate buckets per rule, no limiting at all for
+  an unlisted route, and failing OPEN (never blocking real traffic) when the store itself errors.
+
+### 14. Production Docker verification (manual, this milestone)
+
+Beyond the automated suites above, this milestone's own completion required actually building and
+running `apps/api/Dockerfile` end to end against real Postgres and Redis containers (via
+`docker-compose.prod.yml`, under an isolated Compose project so it never touched the ordinary local
+dev database) — not just inspecting the Dockerfile and assuming it works. This is what caught the
+`migrate.ts` cwd-relative-path bug documented in docs/architecture.md, "Docker" — a bug no amount of
+`npm test`/typecheck/lint would ever have caught, since local dev's working directory happens to
+make the broken relative path resolve correctly by accident. Verified directly: the built image runs
+as the non-root `node` user; `GET /health` and `GET /ready` respond correctly (including `/ready`
+correctly reporting `"degraded"` against a pre-migration database and `"ok"` after migrations run);
+a real register → session-cookie → `GET /api/auth/me` round trip succeeds; the configured security
+headers and `X-Request-ID` are present; and Redis-backed rate limiting genuinely trips a `429` after
+the configured threshold when driven with real repeated requests against the running container.
+
 ## What "passing" actually means here
 
 Every milestone's final verification runs the *entire* existing suite, not just the new resource's

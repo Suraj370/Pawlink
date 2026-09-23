@@ -26,7 +26,10 @@ npm run db:migrate
 | `PORT`          | `3000`                                                 | API listen port.                                                   |
 | `DATABASE_URL`  | `postgres://pawlink:pawlink@localhost:5432/pawlink`    | Must match `docker-compose.yml` credentials for local dev.         |
 | `WEB_ORIGIN`    | `http://localhost:5173`                                | The single origin allowed by CORS; the frontend's dev server URL.  |
-| `MOCK_PAYMENT_WEBHOOK_SECRET` | `dev-mock-payment-webhook-secret`        | Signs/verifies the mock payment provider's webhooks only — not a real payment credential; see [docs/architecture.md](architecture.md). |
+| `MOCK_PAYMENT_WEBHOOK_SECRET` | `dev-mock-payment-webhook-secret`        | Signs/verifies the mock payment provider's webhooks only — not a real payment credential; see [docs/architecture.md](architecture.md). **Must** be a real, non-default value in production — the server refuses to start otherwise. |
+| `REDIS_URL`     | unset                                                  | Optional outside production — rate limiting runs as a no-op without it. Set to `redis://localhost:6379` (after `docker compose up -d redis`) to exercise rate limiting locally. **Required** in production. |
+| `APP_VERSION`   | unset (`"dev"` at runtime)                             | Optional. A safe, non-secret build identifier (commit SHA) surfaced through `GET /health`/`GET /ready`. Set automatically by `apps/api/Dockerfile`'s build arg in a real build. |
+| `TRUST_PROXY`   | `false`                                                | Optional. Whether rate limiting trusts an incoming `X-Forwarded-For` header instead of the raw socket address; see [docs/architecture.md](architecture.md), "Rate limiting." Leave `false` unless a real reverse proxy sits in front of the API and is the sole public entry point — not true of the shipped `docker-compose.prod.yml`. |
 
 `apps/web/.env`:
 
@@ -58,6 +61,7 @@ Migrations live in `apps/api/drizzle/`.
 npm run test           # backend unit/integration tests (Vitest) — requires Postgres running and migrated
 npm run test:e2e       # end-to-end tests (Playwright) — requires Postgres running and migrated
 npm run typecheck      # TypeScript checks across all workspaces
+npm run lint            # ESLint across all workspaces
 npm run build          # production build of all workspaces
 ```
 

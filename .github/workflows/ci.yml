@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A second push to the same branch/PR cancels the still-running run for
+# the previous commit — no point finishing a stale CI run once a newer
+# one has started.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------------
+  # typecheck + lint + production build — fast, no external services
+  # needed, so this runs first and independently of the test job below.
+  # -------------------------------------------------------------------
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - name: Production build
+        run: npm run build
+
+  # -------------------------------------------------------------------
+  # Unit/API/security tests — the entire backend suite (see
+  # docs/testing.md for what each file covers), against a real ephemeral
+  # Postgres service container, exactly like local development uses
+  # (`docker compose up -d postgres`) — never mocked.
+  # -------------------------------------------------------------------
+  api-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pawlink
+          POSTGRES_PASSWORD: pawlink
+          POSTGRES_DB: pawlink
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pawlink -d pawlink"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      NODE_ENV: development
+      DATABASE_URL: postgres://pawlink:pawlink@localhost:5432/pawlink
+      WEB_ORIGIN: http://localhost:5173
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run db:migrate
+      - run: npm run test
+
+  # -------------------------------------------------------------------
+  # Playwright end-to-end suite — the real browser workflows (see
+  # docs/testing.md's per-resource *.spec.ts breakdown), against the
+  # actual dev servers Playwright's own webServer config starts, backed
+  # by the same Postgres service container the api-tests job uses.
+  #
+  # Known limitation (documented, not hidden — see docs/testing.md's own
+  # note on this): a handful of specs share a timing-sensitive UI state
+  # transition (PaymentPanel) that can occasionally need more than a few
+  # seconds to settle under a loaded CI runner; those assertions already
+  # carry a generous explicit timeout for exactly this reason. This job
+  # is allowed to be re-run on a transient failure rather than treated as
+  # a merge-blocking flake — see the job's own retry configuration below.
+  # -------------------------------------------------------------------
+  e2e-tests:
+    runs-on: ubuntu-latest
+    needs: build
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pawlink
+          POSTGRES_PASSWORD: pawlink
+          POSTGRES_DB: pawlink
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pawlink -d pawlink"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      NODE_ENV: development
+      DATABASE_URL: postgres://pawlink:pawlink@localhost:5432/pawlink
+      WEB_ORIGIN: http://localhost:5173
+      VITE_API_URL: http://localhost:3000
+      CI: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run db:migrate
+      - run: npx playwright install --with-deps chromium
+      - name: Run Playwright
+        run: npx playwright test --retries=1
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7

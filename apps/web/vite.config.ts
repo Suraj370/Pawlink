@@ -18,4 +18,12 @@ export default defineConfig({
   server: {
     port: 5173,
   },
+  build: {
+    // Explicit, not just "happens to default to false" — a production
+    // build must not ship source maps for a public deployment (they'd
+    // let anyone reconstruct readable original source, including any
+    // comments, from the minified bundle). See docs/architecture.md,
+    // "Frontend production audit."
+    sourcemap: false,
+  },
 })

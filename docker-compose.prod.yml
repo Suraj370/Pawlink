@@ -1,0 +1,93 @@
+# A production-shaped backend stack: Postgres + Redis + the API, built
+# from real multi-stage Dockerfiles (see apps/api/Dockerfile), run with
+# NODE_ENV=production so every hardening decision in env.ts actually
+# takes effect (a real MOCK_PAYMENT_WEBHOOK_SECRET and REDIS_URL are
+# required, not defaulted).
+#
+# The frontend (apps/web) is NOT part of this stack — it deploys to
+# Vercel (a static Vite build, see apps/web/vercel.json), configured
+# there with VITE_API_URL pointing at wherever this API stack is
+# actually reachable. See docs/architecture.md, "Deployment," for the
+# full picture and exactly what "docker compose -f docker-compose.prod.yml"
+# does and doesn't prove.
+#
+# Usage:
+#   cp apps/api/.env.example apps/api/.env.production   # then fill in
+#   real secrets — never commit this file
+#   docker compose -f docker-compose.prod.yml --env-file apps/api/.env.production up -d --build
+#   docker compose -f docker-compose.prod.yml run --rm api node apps/api/dist/db/migrate.js
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pawlink}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set for a production deployment}
+      POSTGRES_DB: ${POSTGRES_DB:-pawlink}
+    # No host port published — reachable only from other containers on
+    # this network, never directly from outside. A local operator who
+    # needs direct DB access uses `docker compose exec postgres psql ...`.
+    expose:
+      - "5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pawlink} -d ${POSTGRES_DB:-pawlink}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-unknown}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgres://${POSTGRES_USER:-pawlink}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:-pawlink}
+      REDIS_URL: redis://redis:6379
+      WEB_ORIGIN: ${WEB_ORIGIN:?WEB_ORIGIN must be set to the deployed Vercel URL}
+      MOCK_PAYMENT_WEBHOOK_SECRET: ${MOCK_PAYMENT_WEBHOOK_SECRET:?MOCK_PAYMENT_WEBHOOK_SECRET must be set to a real value in production}
+      # Deliberately left at its default (false) here — see env.ts and
+      # lib/clientIp.ts. This stack has no reverse proxy in front of the
+      # api service (its port is published directly to the host, below),
+      # so trusting a client-supplied X-Forwarded-For would let anyone
+      # bypass rate limiting by spoofing it. Only set TRUST_PROXY=true if
+      # a real reverse proxy/load balancer that is the sole public entry
+      # point is added in front of this service AND is configured to
+      # set/overwrite that header itself — not true of this file today.
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+    # Published to the host so it's reachable directly for smoke tests
+    # and so a Vercel-hosted frontend (or any external client) can reach
+    # it — this is the one publicly-facing piece of this stack. A real
+    # deployment would put a TLS-terminating reverse proxy or load
+    # balancer in front of this port rather than exposing plain HTTP
+    # directly; that's infrastructure this compose file deliberately
+    # doesn't attempt to reproduce (see docs/architecture.md, "Known
+    # limitations"). Because there is no such proxy, TRUST_PROXY above
+    # stays false — see that line's own comment.
+    ports:
+      - "${API_PORT:-3000}:3000"
+
+volumes:
+  pgdata:

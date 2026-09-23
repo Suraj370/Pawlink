@@ -88,7 +88,7 @@ test("a booking made by one customer cannot be viewed or cancelled by another cu
     const paymentPanel = pageA.getByTestId("payment-panel");
     await expect(paymentPanel).toBeVisible();
     await paymentPanel.getByTestId("pay-success-button").click();
-    await expect(paymentPanel.getByTestId("payment-status-succeeded")).toBeVisible();
+    await expect(paymentPanel.getByTestId("payment-status-succeeded")).toBeVisible({ timeout: 15_000 });
 
     await expect(pageA.getByTestId("booking-confirmation")).toBeVisible();
 

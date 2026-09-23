@@ -82,7 +82,7 @@ test("customer books an available slot end to end, and it disappears from availa
     const paymentPanel = customerPage.getByTestId("payment-panel");
     await expect(paymentPanel).toBeVisible();
     await paymentPanel.getByTestId("pay-success-button").click();
-    await expect(paymentPanel.getByTestId("payment-status-succeeded")).toBeVisible();
+    await expect(paymentPanel.getByTestId("payment-status-succeeded")).toBeVisible({ timeout: 15_000 });
 
     await expect(customerPage.getByTestId("booking-confirmation")).toBeVisible();
 
@@ -169,7 +169,7 @@ test("customer cancels a booking, freeing the slot again", async ({ page }) => {
   const paymentPanel = page.getByTestId("payment-panel");
   await expect(paymentPanel).toBeVisible();
   await paymentPanel.getByTestId("pay-success-button").click();
-  await expect(paymentPanel.getByTestId("payment-status-succeeded")).toBeVisible();
+  await expect(paymentPanel.getByTestId("payment-status-succeeded")).toBeVisible({ timeout: 15_000 });
 
   await expect(page.getByTestId("booking-confirmation")).toBeVisible();
 
