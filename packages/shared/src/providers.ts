@@ -95,7 +95,10 @@ export type AdminUpdateProviderInput = z.infer<typeof adminUpdateProviderSchema>
 // Never includes ownerId. isOwner is a computed boolean (true only when
 // the requester is authenticated as the owner or an admin) so the
 // frontend can gate Edit/Delete UI without the raw foreign key ever
-// leaving the server.
+// leaving the server. averageRating/reviewCount are the same aggregate
+// reviews.ts's reviewAggregateSchema describes — computed fresh from the
+// reviews table on every request (see routes/providers.ts), never a
+// cached/stale value stored on the provider row itself.
 export const publicProviderSchema = z.object({
   id: z.string(),
   businessName: z.string(),
@@ -112,6 +115,8 @@ export const publicProviderSchema = z.object({
   timezone: z.string(),
   status: providerStatusSchema,
   isOwner: z.boolean(),
+  averageRating: z.number().nullable(),
+  reviewCount: z.number(),
   createdAt: z.string(),
   updatedAt: z.string(),
 });

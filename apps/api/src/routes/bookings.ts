@@ -419,5 +419,72 @@ export function createBookingRoutes(db: DbClient, nodeEnv: string) {
     }
   });
 
+  // -----------------------------------------------------------------------
+  // POST /:id/complete — the owning provider (or an admin) marks a
+  // CONFIRMED appointment as having actually happened. This is the one
+  // and only way a booking ever reaches COMPLETED (see
+  // packages/shared/src/bookings.ts's documented lifecycle — CONFIRMED ->
+  // COMPLETED has always been a legal transition, nothing produced it
+  // until now) — added as the necessary prerequisite for review
+  // eligibility (see routes/reviews.ts and docs/architecture.md, "Reviews
+  // & ratings"), not a general-purpose booking feature.
+  //
+  // Deliberately provider/admin-only, never the customer: COMPLETED is an
+  // attestation that the service was actually delivered, and only the
+  // provider is in a position to know that. Same SELECT ... FOR UPDATE
+  // locking as cancel, for the same reason — a plain read-then-write would
+  // let a concurrent cancel and complete both read CONFIRMED and both
+  // succeed, when at most one legal transition should win.
+  // -----------------------------------------------------------------------
+  app.post("/:id/complete", async (c) => {
+    const idResult = uuidSchema.safeParse(c.req.param("id"));
+    if (!idResult.success) return c.json({ error: "Invalid booking id" }, 400);
+
+    const user = c.get("user");
+
+    try {
+      const updated = await db.transaction(async (tx) => {
+        const [booking] = await tx.select().from(bookings).where(eq(bookings.id, idResult.data)).for("update");
+        if (!booking) throw new BookingRouteError(404, BOOKING_NOT_FOUND);
+
+        const isProviderOwner = await loadProviderForBooking(booking, user.id, user.role, tx);
+        if (!isProviderOwner) {
+          // The booking's own customer already knows this booking exists
+          // (it's theirs) — telling them plainly that only the provider
+          // can complete it leaks nothing new. Anyone else gets the same
+          // 404 a nonexistent booking would, per this codebase's usual
+          // IDOR-hiding convention.
+          if (booking.customerUserId === user.id) {
+            throw new BookingRouteError(403, { error: "Only the provider can mark a booking complete" });
+          }
+          throw new BookingRouteError(404, BOOKING_NOT_FOUND);
+        }
+
+        try {
+          assertBookingStatusTransition(booking.status, "COMPLETED");
+        } catch (err) {
+          if (err instanceof BookingStatusTransitionError) {
+            throw new BookingRouteError(409, { error: err.message });
+          }
+          throw err;
+        }
+
+        const [row] = await tx
+          .update(bookings)
+          .set({ status: "COMPLETED", updatedAt: new Date() })
+          .where(eq(bookings.id, idResult.data))
+          .returning();
+        return row;
+      });
+
+      return c.json({ booking: toPublicBooking(updated) }, 200);
+    } catch (err) {
+      if (err instanceof BookingRouteError) {
+        return c.json(err.body, err.status);
+      }
+      throw err;
+    }
+  });
+
   return app;
 }

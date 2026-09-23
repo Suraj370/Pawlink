@@ -263,6 +263,67 @@ through the mock provider to `CONFIRMED`):
   customer's own unrelated pet shows neither the record nor even an "Add" control, proving the
   history never leaks across pets that happen to be viewed in the same UI shell.
 
+### 9. Reviews tests (`apps/api/src/reviews.test.ts`, `apps/api/src/reviews-security.test.ts`)
+
+Same split as medical records, for the same reason: the authorization/uniqueness/aggregate
+guarantees *are* the feature here, not a secondary property of a CRUD resource.
+
+- **`reviews.test.ts`** — booking completion (`POST /api/bookings/:id/complete`: provider-owner-only,
+  `403` for the customer attempting their own booking, `404` for an unrelated caller, `409` for a
+  non-`CONFIRMED` booking or completing twice), review creation (valid creation; whitespace-only
+  title/comment trimmed to absent, not stored; every rating-validation edge — `0`, `6`, `-1`, `3.5`,
+  `999999`; title >150 chars; comment >2000 chars; `PENDING`/`CONFIRMED`/`CANCELLED` bookings all
+  rejected with `409`; a duplicate submission rejected with `409` and independently re-verified
+  against the database to be exactly one row; mass-assignment of
+  `bookingId`/`customerUserId`/`providerId`/`status`/`createdAt` all silently ignored), the mandatory
+  concurrent-duplicate-review race test, editing (`PATCH` changes content, identity fields are
+  immutable even when the client sends them, empty patch is `400`), the public provider review list
+  (`[5,5,4]` -> average `4.67`/count `3`, a zero-review provider gets `averageRating: null` not `0`,
+  the provider detail endpoint and the review-list endpoint agree on the same aggregate number), and
+  an XSS/adversarial block proving a `<script>` payload round-trips as inert stored text.
+- **`reviews-security.test.ts`** — the mandatory authorization matrix named in the milestone brief:
+  customer reviews own completed booking (allowed), customer reviews another customer's booking
+  (`404`), customer reviews their own cancelled/pending booking (`409` — they already know the
+  booking's state, so this isn't a `404`-hiding case), customer reviews someone else's completed
+  booking (`404`), a spoofed `providerId`/`customerUserId` in the request body is silently ignored
+  (asserted by checking the row that actually got written, not just the HTTP response), the provider
+  attempting to review as if they were the customer (`403`), the provider editing a customer's review
+  (`404`), a customer editing another customer's review (`404`), sequential/random review-id
+  enumeration via `PATCH` never disclosing content, no `DELETE` route exists, an unauthenticated
+  caller is rejected on both create and edit, and the public list never contains a
+  `customerUserId`/`customerEmail` key anywhere in its response shape. A separate `describe` block
+  proves the database constraints hold independent of the API layer: inserting a second review row
+  for an already-reviewed `booking_id` directly through Drizzle throws (the `UNIQUE` constraint,
+  not application logic); inserting `rating: 0` or `rating: 6` directly throws (the `CHECK`
+  constraint); inserting a nonexistent `booking_id` throws (the foreign key).
+
+### 10. Reviews Playwright specs (`e2e/reviews.spec.ts`)
+
+Two full real-browser workflows, both built on a shared setup that goes one step further than
+`bookings.spec.ts`'s own confirmed-booking setup: after the booking is paid to `CONFIRMED`, the
+provider owner explicitly marks it complete through the real "Mark complete" UI control (accepting
+the `window.confirm()` dialog, same pattern `bookings.spec.ts`'s cancel flow already uses) before
+either workflow begins.
+
+- **Customer workflow**: on the now-`COMPLETED` booking's detail page, the review panel offers a
+  write form (not a read view) with no review yet; selecting 5 stars, filling a title/comment, and
+  submitting replaces the write form with a read view of the just-created review (never a duplicate
+  form), which survives a full page reload; the provider's public rating headline reflects the new
+  `5.00 · 1 review` immediately after.
+- **Provider workflow**: the same new review appears in the provider's public reviews section with
+  the correct aggregate (`4.00 · 1 review`), and the reviewing customer's email is asserted absent
+  from the entire reviews section's rendered text — proving the privacy-minimized display name is
+  actually what's shown, not just what the API returns.
+
+A note on a pre-existing timing subtlety these specs deliberately route around: `PaymentPanel`'s
+transient "Payment successful." state can, under load, be unmounted (by the booking query's own
+invalidation swapping the parent view to the confirmation screen) before Playwright ever observes it
+— a genuine race in that shared component, not something introduced by this milestone (confirmed by
+reproducing the identical failure against the pre-existing, untouched `bookings.spec.ts` under the
+same load). `reviews.spec.ts`'s setup helper asserts the terminal `booking-confirmation` state
+directly instead of the intermediate one, which is an equally reliable signal (never reached on a
+failed/pending payment — see `payments.spec.ts`) without depending on that race's timing.
+
 ## What "passing" actually means here
 
 Every milestone's final verification runs the *entire* existing suite, not just the new resource's

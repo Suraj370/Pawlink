@@ -1,9 +1,14 @@
-import type { ProviderStatus, PublicProvider, Role } from "@pawlink/shared";
+import type { ProviderStatus, PublicProvider, ReviewAggregate, Role } from "@pawlink/shared";
 import type { providers } from "../db/schema.js";
 
 type ProviderRow = typeof providers.$inferSelect;
 
-export function toPublicProvider(provider: ProviderRow, isOwner: boolean): PublicProvider {
+// aggregate is always supplied by the caller (routes/providers.ts),
+// computed fresh from the reviews table for the rows actually being
+// returned — never a cached column on the provider row itself, and never
+// optional/defaulted here, so a route can't forget to compute it and
+// silently ship a wrong rating.
+export function toPublicProvider(provider: ProviderRow, isOwner: boolean, aggregate: ReviewAggregate): PublicProvider {
   return {
     id: provider.id,
     businessName: provider.businessName,
@@ -20,6 +25,8 @@ export function toPublicProvider(provider: ProviderRow, isOwner: boolean): Publi
     timezone: provider.timezone,
     status: provider.status,
     isOwner,
+    averageRating: aggregate.averageRating,
+    reviewCount: aggregate.reviewCount,
     createdAt: provider.createdAt.toISOString(),
     updatedAt: provider.updatedAt.toISOString(),
   };

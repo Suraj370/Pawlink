@@ -31,6 +31,7 @@ import {
   PET_SEX_VALUES,
   PROVIDER_STATUS_VALUES,
   PROVIDER_TYPE_VALUES,
+  REVIEW_STATUS_VALUES,
   ROLES,
 } from "@pawlink/shared";
 
@@ -559,5 +560,56 @@ export const auditLogs = pgTable(
     providerIdIdx: index("audit_logs_provider_id_idx").on(table.providerId),
     resourceIdx: index("audit_logs_resource_idx").on(table.resourceType, table.resourceId),
     createdAtIdx: index("audit_logs_created_at_idx").on(table.createdAt),
+  }),
+);
+
+export const reviewStatusEnum = pgEnum("review_status", REVIEW_STATUS_VALUES);
+
+// A review is EARNED, not merely created: booking_id is UNIQUE (the
+// actual "one review per booking" invariant — see routes/reviews.ts,
+// which additionally relies on this exact constraint, not just an
+// application-level check, to make concurrent duplicate submissions safe)
+// and RESTRICT (never CASCADE) so a review can never silently disappear
+// because its booking somehow did. customer_user_id and provider_id are
+// both denormalized from the booking at creation time (never trusted
+// as client input — see createReviewSchema) purely so every other query
+// in this feature (a provider's review list, an aggregate rating) never
+// has to join back through bookings; they still always agree with
+// booking_id's own customer/provider by construction, since routes/
+// reviews.ts derives them from the SAME booking row, in the SAME
+// request, as the one whose id gets stored.
+export const reviews = pgTable(
+  "reviews",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    bookingId: uuid("booking_id")
+      .notNull()
+      .references(() => bookings.id, { onDelete: "restrict" }),
+    customerUserId: uuid("customer_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    providerId: uuid("provider_id")
+      .notNull()
+      .references(() => providers.id, { onDelete: "restrict" }),
+    rating: integer("rating").notNull(),
+    title: varchar("title", { length: 150 }),
+    comment: text("comment"),
+    status: reviewStatusEnum("status").notNull().default("PUBLISHED"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    // THE one-review-per-booking guarantee — a hard uniqueness constraint,
+    // not just "SELECT then INSERT if none": two genuinely concurrent
+    // POSTs for the same booking are serialized by Postgres itself, and
+    // the loser gets a clean, catchable unique-violation rather than a
+    // second row ever existing. See routes/reviews.ts.
+    bookingIdUnique: unique("reviews_booking_id_unique").on(table.bookingId),
+    providerIdIdx: index("reviews_provider_id_idx").on(table.providerId),
+    // Covers the exact predicate the public provider review list uses:
+    // WHERE provider_id = ? AND status = 'PUBLISHED' ORDER BY created_at.
+    providerStatusIdx: index("reviews_provider_status_idx").on(table.providerId, table.status),
+    customerUserIdIdx: index("reviews_customer_user_id_idx").on(table.customerUserId),
+    ratingRangeCheck: check("reviews_rating_range", sql`${table.rating} >= 1 AND ${table.rating} <= 5`),
   }),
 );

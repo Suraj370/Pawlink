@@ -46,6 +46,15 @@ export async function cancelBooking(id: string): Promise<PublicBooking> {
   return booking;
 }
 
+// Provider-only — the owning provider attests the appointment actually
+// happened. This is the one and only way a booking reaches COMPLETED,
+// which in turn is the prerequisite for the customer being able to leave
+// a review (see features/reviews). See apps/api/src/routes/bookings.ts.
+export async function completeBooking(id: string): Promise<PublicBooking> {
+  const { booking } = await apiClient.post(`api/bookings/${id}/complete`).json<BookingResponse>();
+  return booking;
+}
+
 export const bookingsQueryOptions = (filters: BookingFilters = {}) =>
   queryOptions({
     queryKey: ["bookings", filters] as const,

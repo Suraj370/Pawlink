@@ -14,6 +14,7 @@ import { createAvailabilityRoutes } from "./routes/availability.js";
 import { createBookingRoutes } from "./routes/bookings.js";
 import { createBookingPaymentRoutes, createMockPaymentProvider, createPaymentRoutes } from "./routes/payments.js";
 import { createMedicalRecordRoutes, createPetMedicalRecordRoutes } from "./routes/medical-records.js";
+import { createBookingReviewRoutes, createProviderReviewRoutes, createReviewRoutes } from "./routes/reviews.js";
 
 export function createApp(db: DbClient, env: Env) {
   const app = new Hono<AppEnv>();
@@ -51,6 +52,9 @@ export function createApp(db: DbClient, env: Env) {
   app.route("/api/payments", createPaymentRoutes(db, env.NODE_ENV, paymentProvider));
   app.route("/api/pets/:petId/medical-records", createPetMedicalRecordRoutes(db, env.NODE_ENV));
   app.route("/api/medical-records", createMedicalRecordRoutes(db, env.NODE_ENV));
+  app.route("/api/bookings/:bookingId/review", createBookingReviewRoutes(db, env.NODE_ENV));
+  app.route("/api/reviews", createReviewRoutes(db, env.NODE_ENV));
+  app.route("/api/providers/:providerId/reviews", createProviderReviewRoutes(db));
 
   app.notFound((c) => {
     return c.json({ error: "Not Found" }, 404);

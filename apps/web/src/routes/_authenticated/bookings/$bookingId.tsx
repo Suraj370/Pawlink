@@ -6,6 +6,7 @@ import { toErrorMessage } from "@/lib/api/errors"
 import { useBooking, useCancelBooking } from "@/features/bookings/hooks"
 import { PaymentPanel } from "@/features/payments/components/PaymentPanel"
 import { priceMinorToMajor } from "@/features/services/money"
+import { ReviewPanel } from "@/features/reviews/components/ReviewPanel"
 
 export const Route = createFileRoute("/_authenticated/bookings/$bookingId")({
   component: BookingDetailsPage,
@@ -91,6 +92,7 @@ function BookingDetailsPage() {
           {cancelBooking.isPending ? "Cancelling…" : "Cancel booking"}
         </Button>
       )}
+      {booking.status === "COMPLETED" && <ReviewPanel bookingId={booking.id} />}
     </main>
   )
 }

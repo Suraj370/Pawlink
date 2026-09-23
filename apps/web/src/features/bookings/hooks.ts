@@ -3,6 +3,7 @@ import {
   bookingQueryOptions,
   bookingsQueryOptions,
   cancelBooking,
+  completeBooking,
   createBooking,
   type BookingFilters,
 } from "./api";
@@ -45,6 +46,14 @@ export function useCancelBooking() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: cancelBooking,
+    onSuccess: (booking) => invalidateAfterBookingChange(queryClient, booking),
+  });
+}
+
+export function useCompleteBooking() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: completeBooking,
     onSuccess: (booking) => invalidateAfterBookingChange(queryClient, booking),
   });
 }

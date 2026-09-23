@@ -9,6 +9,7 @@ import { ExceptionsManager } from "@/features/availability/components/Exceptions
 import { SlotPicker } from "@/features/availability/components/SlotPicker"
 import { WeeklyRulesManager } from "@/features/availability/components/WeeklyRulesManager"
 import { ProviderBookingsPanel } from "@/features/bookings/components/ProviderBookingsPanel"
+import { ProviderReviewsList } from "@/features/reviews/components/ProviderReviewsList"
 
 export const Route = createFileRoute("/providers/$providerId")({
   component: ProviderDetailsPage,
@@ -98,6 +99,10 @@ function ProviderDetailsPage() {
           {provider.businessName}
         </h1>
         <p className="text-sm text-muted-foreground">{provider.providerType}</p>
+        <p className="text-sm text-muted-foreground" data-testid="provider-rating-headline">
+          {provider.averageRating !== null ? `${provider.averageRating.toFixed(2)} ★` : "No ratings yet"} ·{" "}
+          {provider.reviewCount} review{provider.reviewCount === 1 ? "" : "s"}
+        </p>
       </div>
       {provider.description && <p className="text-sm">{provider.description}</p>}
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
@@ -157,6 +162,9 @@ function ProviderDetailsPage() {
         </div>
       )}
       <SlotPicker providerId={provider.id} />
+      <div className="border-t border-border pt-6">
+        <ProviderReviewsList providerId={provider.id} />
+      </div>
     </main>
   )
 }

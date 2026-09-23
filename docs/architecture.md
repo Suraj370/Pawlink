@@ -882,3 +882,163 @@ medical decision-making, matching the milestone brief precisely.
 - **No un-archive.** Archiving is one-directional through the API; reactivating a mistakenly-archived
   record isn't supported yet (would need its own audited action, deliberately not added
   speculatively).
+
+## Reviews & ratings
+
+**A review is earned through a completed booking, not created merely by knowing a provider ID.**
+That single rule is the entire authorization model for this milestone; everything below is either a
+consequence of it or the plumbing needed to make it enforceable.
+
+### Booking completion — the necessary prerequisite
+
+Before this milestone, nothing in the codebase ever moved a booking to `COMPLETED` — it was a legal
+transition in the state table (`CONFIRMED -> COMPLETED`, see Booking engine, above) that nothing
+produced. This milestone adds the one thing that does: `POST /api/bookings/:id/complete`, callable
+only by the booking's own provider owner (or an admin) — **never the customer**, since `COMPLETED`
+is an attestation that the service was actually delivered, and only the provider is in a position to
+know that. It uses the exact same `SELECT ... FOR UPDATE`-inside-a-transaction locking `POST
+/:id/cancel` already uses, for the same reason: a plain read-then-write would let a concurrent
+cancel and complete both read `CONFIRMED` and both "succeed," when at most one legal transition
+should actually win. A customer attempting to complete their own booking gets a `403` (they already
+know it exists — no information leak); anyone with no relationship to the booking at all gets the
+usual `404`.
+
+### The eligibility rule
+
+```
+customer may review a provider
+  <=>  customer owns a booking
+  AND  that booking.status = COMPLETED
+  AND  that booking has no review yet (UNIQUE(booking_id))
+```
+
+`PENDING` (payment not settled), `CONFIRMED` (appointment hasn't happened yet), and `CANCELLED`
+bookings are all rejected with a `409` — not a `404` and not silently accepted — because the caller
+in every one of these cases already owns the booking in question and knows perfectly well what state
+it's in; there's nothing to hide. A booking belonging to someone else is a different matter and
+returns the usual `404` (see `POST /api/bookings/:bookingId/review` in `routes/reviews.ts`).
+
+### Identity is always derived from the booking and the session, never the client
+
+`createReviewSchema` (`packages/shared/src/reviews.ts`) has no `bookingId`, `customerUserId`, or
+`providerId` fields at all — structurally, a client cannot supply any of them as part of a review.
+The route derives `customerUserId` from the authenticated session and `providerId` from the
+**booking row itself** (`booking.providerId`), in the same request that validates the booking is the
+caller's own and is `COMPLETED` — never a value read earlier, never trusted from anywhere else. This
+is the direct defense against a malicious body like
+`{"bookingId": "my-booking", "providerId": "someone-else's-provider", ...}`: the `providerId` key, if
+present, is simply never read.
+
+### One review per booking — enforced by the database, not just application logic
+
+`reviews.booking_id` is `UNIQUE` (see the migration) and `RESTRICT` (never `CASCADE`) — a review can
+never silently disappear because its booking did, and a booking can never end up with two reviews no
+matter how the requests are timed. `POST /api/bookings/:bookingId/review` does an ordinary `INSERT`
+and catches Postgres's unique-violation error code (`23505`) as a clean `409`, exactly the same
+pattern `booking_idempotency_keys` and the bookings `EXCLUDE` constraint already use elsewhere in
+this codebase — **the database is what makes two genuinely concurrent submissions for the same
+booking safe**, not a `SELECT`-then-`INSERT` check (which has an inherent race window an app-level
+check alone cannot close). Verified directly with a real concurrent `Promise.all` of two review
+submissions for the same booking, asserting exactly one `201`/one `409` and exactly one row in the
+database afterward.
+
+### Rating validation
+
+An integer 1–5, nothing else — `0`, `6`, `-1`, `3.5`, and `999999` are all rejected. Enforced at the
+Zod layer (`ratingSchema`) **and** the database layer (a hand-added `CHECK` constraint, since
+drizzle-kit 0.24.2 doesn't emit `CHECK` from the schema builder — the same documented gap as every
+other `check()`-declared constraint in this codebase). Both layers matter: Zod protects the normal
+API path with a helpful field-level error; the `CHECK` constraint protects the invariant even from a
+bug in application code or a future direct-database write.
+
+### Editing — content only, identity never
+
+`PATCH /api/reviews/:id` accepts `rating`/`title`/`comment` and nothing else (`updateReviewSchema`
+has no other fields) — a client sending `bookingId`/`customerUserId`/`providerId`/`createdAt` simply
+has those keys silently stripped by Zod before the route ever sees them, matching this codebase's
+established mass-assignment policy (see Foundation, above). Only the reviewing customer may edit
+their own review; not the reviewed provider, not another customer, and — a deliberate scope decision
+matching the milestone brief's "do not add complicated admin workflows yet" — not even an admin. An
+id that doesn't resolve to the caller's own review returns the same `404` a nonexistent one would.
+
+### Deletion — deliberately not implemented
+
+There is no `DELETE /api/reviews/:id` endpoint. A review is a piece of historical business record
+the same way a booking or a medical record is; the milestone brief explicitly prefers a soft/
+moderation state over physical deletion. `reviews.status` (`PUBLISHED`/`HIDDEN`) exists today purely
+as that forward-compatible hook — every review created through this milestone is `PUBLISHED`, and
+nothing in this codebase currently sets it to `HIDDEN` or exposes a way to. Building the actual
+moderation workflow (who can hide a review, an admin surface, an appeals path) is explicitly out of
+scope here, matching "do not add complicated admin workflows yet" and "Admin / Operations" being a
+later, separate milestone.
+
+### Public visibility and reviewer privacy
+
+`GET /api/providers/:providerId/reviews` is public (no session required) and returns only
+`PUBLISHED` reviews, deliberately **not** gated on the provider's own current status
+(`ACTIVE`/`INACTIVE`/`SUSPENDED`) — unlike services/availability, a review is a record of service
+already received and stays visible even after a provider later deactivates. Every review in the
+response carries a `reviewerDisplayName` (`lib/review.ts`'s `toReviewerDisplayName`) derived from
+the reviewing customer's stored account name — "Suraj Panda" becomes "Suraj P." — **never** the raw
+full name, and never the email or the customer's internal user id, either of which would be a new
+PII exposure this codebase hasn't had before. A provider can see reviews for their own provider the
+same way anyone else can (the public list); they get no elevated view of reviewer identity and
+cannot alter another customer's review through any endpoint.
+
+### "Verified booking"
+
+Every review in this system was, by construction, created from a booking that had already reached
+`COMPLETED` — there is no code path that creates one any other way. The frontend labels every review
+"Verified booking" unconditionally (see `ReviewPanel`/`ProviderReviewsList`) rather than storing a
+redundant boolean that could only ever be `true`; the guarantee lives in the schema (the `NOT NULL`,
+`RESTRICT` `booking_id` foreign key and the eligibility check above), not in a flag that could
+theoretically drift from it.
+
+### Provider aggregate rating
+
+`averageRating`/`reviewCount` are computed fresh from the `reviews` table on every request that
+needs them (`lib/review.ts`'s `getReviewAggregate`/`getReviewAggregates`) — never a cached/stale
+column on the `providers` row itself. A single grouped SQL query computes the aggregate for an
+entire page of providers at once (`GET /api/providers`), never one query per provider, and only
+`PUBLISHED` reviews are ever counted, so a future `HIDDEN` review can never inflate or deflate a
+rating. A provider with zero (or zero *published*) reviews gets `averageRating: null`, never `0` — a
+provider that has simply never been reviewed is not the same thing as a one-star provider, and the
+frontend renders that distinction explicitly ("No ratings yet" vs. a numeric average). The average is
+rounded to 2 decimal places in application code after the `SUM`/`COUNT` aggregation happens in
+Postgres — `[5, 5, 4]` -> `4.67`, not `4.666666...` and not a float-accumulation artifact from
+summing many rows in JavaScript.
+
+### Injection / XSS safety
+
+Review `title`/`comment` are stored and returned as plain strings; nothing in this codebase ever
+renders them through `dangerouslySetInnerHTML` or any other raw-HTML sink — `ReviewPanel`,
+`ReviewForm`, and `ProviderReviewsList` all render review text as ordinary JSX text children, which
+React escapes by construction. A stored `<script>alert(1)</script>` payload round-trips through the
+API exactly as submitted (proven directly in `reviews.test.ts`) and renders as inert visible text in
+the browser, never executes.
+
+### Frontend
+
+`apps/web/src/features/reviews/` follows the same `{api,hooks,schemas,components}` shape as every
+other feature. `ReviewPanel` mounts on the booking detail page only once `booking.status ===
+"COMPLETED"` and reflects, never decides: it fetches `GET /api/bookings/:bookingId/review`, shows a
+write form on a `404` (no review yet) or a read view with an edit action once one exists — the same
+"server decides, UI reflects" discipline `PaymentPanel` already established. `ProviderReviewsList`
+is the public, unauthenticated view mounted on the provider profile page, alongside a one-line
+rating headline computed from the same aggregate the API already returns on the provider object
+itself (no second round trip needed for that summary line). `ProviderBookingsPanel` gained a "Mark
+complete" action for `CONFIRMED` bookings, the UI entry point for the provider-side completion flow
+above.
+
+### Known limitations
+
+- **No moderation workflow.** `reviews.status` exists as a schema-level hook (`PUBLISHED`/`HIDDEN`)
+  but nothing sets it to `HIDDEN` yet — flagging/hiding abusive reviews is explicit follow-up work
+  for the later "Admin / Operations" milestone, not this one.
+- **No review deletion**, by the pet-owner-equivalent policy of "historical record, not silently
+  erased" — see "Deletion," above.
+- **No automatic/time-based completion.** A booking only reaches `COMPLETED` when the provider
+  explicitly marks it so; there's no job that completes a booking automatically once its scheduled
+  end time has passed. Providers who never mark an appointment complete leave that booking's
+  customer permanently unable to review it — an accepted trade-off for this milestone rather than
+  building a background job.

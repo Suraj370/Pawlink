@@ -88,7 +88,7 @@ export class IdempotencyRaceError extends Error {}
 // response shape the pre-hardening code returned for each case.
 export class BookingRouteError extends Error {
   constructor(
-    public readonly status: 404 | 409,
+    public readonly status: 403 | 404 | 409,
     public readonly body: Record<string, unknown>,
   ) {
     super(`BookingRouteError(${status})`);

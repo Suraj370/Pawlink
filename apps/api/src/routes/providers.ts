@@ -12,6 +12,7 @@ import type { AppEnv } from "../types.js";
 import type { DbClient } from "../db/client.js";
 import { providers } from "../db/schema.js";
 import { StatusTransitionError, assertStatusTransitionAllowed, toPublicProvider } from "../lib/provider.js";
+import { getReviewAggregate, getReviewAggregates } from "../lib/review.js";
 import { SESSION_COOKIE_NAME } from "../lib/session.js";
 import { createRequireAuth, resolveUser } from "../middleware/auth.js";
 
@@ -65,9 +66,10 @@ export function createProviderRoutes(db: DbClient, nodeEnv: string) {
       db.select({ count: sql<number>`count(*)::int` }).from(providers).where(where),
     ]);
 
+    const aggregates = await getReviewAggregates(db, rows.map((p) => p.id));
     return c.json(
       {
-        providers: rows.map((p) => toPublicProvider(p, false)),
+        providers: rows.map((p) => toPublicProvider(p, false, aggregates.get(p.id) ?? { averageRating: null, reviewCount: 0 })),
         page,
         pageSize,
         total: totalResult[0]?.count ?? 0,
@@ -98,7 +100,9 @@ export function createProviderRoutes(db: DbClient, nodeEnv: string) {
       .values({ ...parsed.data, ownerUserId: user.id })
       .returning();
 
-    return c.json({ provider: toPublicProvider(inserted, true) }, 201);
+    // A brand-new provider has no bookings yet, so it structurally cannot
+    // have any reviews — no query needed to know the aggregate is empty.
+    return c.json({ provider: toPublicProvider(inserted, true, { averageRating: null, reviewCount: 0 }) }, 201);
   });
 
   app.get("/:id", async (c) => {
@@ -119,7 +123,8 @@ export function createProviderRoutes(db: DbClient, nodeEnv: string) {
       return c.json(NOT_FOUND, 404);
     }
 
-    return c.json({ provider: toPublicProvider(provider, isOwnerOrAdmin) }, 200);
+    const aggregate = await getReviewAggregate(db, provider.id);
+    return c.json({ provider: toPublicProvider(provider, isOwnerOrAdmin, aggregate) }, 200);
   });
 
   app.patch("/:id", requireAuth, async (c) => {
@@ -173,7 +178,8 @@ export function createProviderRoutes(db: DbClient, nodeEnv: string) {
       .where(eq(providers.id, idResult.data))
       .returning();
 
-    return c.json({ provider: toPublicProvider(updated, true) }, 200);
+    const patchAggregate = await getReviewAggregate(db, updated.id);
+    return c.json({ provider: toPublicProvider(updated, true, patchAggregate) }, 200);
   });
 
   // Soft delete: sets status to INACTIVE rather than removing the row.
@@ -211,7 +217,8 @@ export function createProviderRoutes(db: DbClient, nodeEnv: string) {
       .where(eq(providers.id, idResult.data))
       .returning();
 
-    return c.json({ success: true, provider: toPublicProvider(updated, true) }, 200);
+    const deleteAggregate = await getReviewAggregate(db, updated.id);
+    return c.json({ success: true, provider: toPublicProvider(updated, true, deleteAggregate) }, 200);
   });
 
   return app;

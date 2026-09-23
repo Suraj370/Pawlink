@@ -3,8 +3,9 @@
 A multi-sided pet-care platform connecting pet parents, vets, groomers, boarding providers, and
 platform administrators. This repository currently implements the project foundation,
 authentication, pet management, provider management, service management, availability management,
-the booking engine, a payment abstraction with a deterministic mock provider, and a secure, audited
-medical-records system — no other business features are implemented yet.
+the booking engine, a payment abstraction with a deterministic mock provider, a secure, audited
+medical-records system, and provider reviews & ratings earned through a completed booking — no other
+business features are implemented yet.
 
 ## Stack
 
@@ -37,10 +38,10 @@ Full setup details, environment variables, and prerequisites live in
 
 ```text
 apps/
-  api/      Hono API service (health check, auth, pets, providers, services, availability, bookings, payments, medical records)
+  api/      Hono API service (health check, auth, pets, providers, services, availability, bookings, payments, medical records, reviews)
   web/      React/Vite frontend (TanStack Router/Query, Ky, shadcn/Tailwind UI)
 packages/
-  shared/   Shared types & Zod schemas (health, auth, pets, providers, services, availability, bookings, payments, medical records, audit)
+  shared/   Shared types & Zod schemas (health, auth, pets, providers, services, availability, bookings, payments, medical records, audit, reviews)
 e2e/        Playwright end-to-end tests
 docs/       Project documentation
 ```
@@ -65,6 +66,7 @@ and what each layer of the test suite covers.
 | Bookings       | `POST/GET /api/bookings`, `GET /api/bookings/:id`, `POST /api/bookings/:id/cancel`               | authenticated |
 | Payments       | `POST/GET /api/bookings/:bookingId/payment`, `GET /api/payments/:id`, `POST /api/payments/webhook` | authenticated (webhook: signature-verified, not session) |
 | Medical records | `GET/POST /api/pets/:petId/medical-records`, `GET/PATCH /api/medical-records/:id`, `POST /api/medical-records/:id/archive` | pet owner (read) / treating provider (read+write) — see below |
+| Reviews         | `GET/POST /api/bookings/:bookingId/review`, `PATCH /api/reviews/:id`, `GET /api/providers/:providerId/reviews` | booking's own customer (write) / public (provider list) — see below |
 
 Every mutating endpoint derives ownership from the authenticated session, never from a
 client-supplied id. Full request/response shapes and the authorization model are documented in
@@ -130,6 +132,21 @@ client-supplied id. Full request/response shapes and the authorization model are
   (`MEDICAL_RECORD_CREATED/VIEWED/UPDATED/ARCHIVED`, `AUTHORIZATION_DENIED`) that never duplicates
   medical content. See [docs/architecture.md](docs/architecture.md), "Medical records," for the
   full authorization model and its rationale.
+
+- **Reviews & ratings**: a customer may review a provider only through a booking they actually own
+  that has reached `COMPLETED` — never merely by knowing a provider ID (`POST
+  /api/bookings/:bookingId/review`). `COMPLETED` is itself new in this milestone: the owning
+  provider (never the customer) marks an appointment complete
+  (`POST /api/bookings/:id/complete`), the one and only way a booking reaches that state. A booking
+  can carry at most one review, enforced by a database `UNIQUE(booking_id)` constraint (not just an
+  application check), proven safe under genuine concurrent duplicate submissions. Ratings are a
+  strict 1–5 integer, validated at both the Zod and database layers. A review's identity
+  (`bookingId`/`customerUserId`/`providerId`) always comes from the booking row and the session,
+  never the client; only the reviewing customer may amend their own review's content afterward
+  (`PATCH /api/reviews/:id`). Provider profiles show a live aggregate rating and review count
+  (`GET /api/providers/:providerId/reviews`, also folded into every provider response), computed
+  fresh from the `reviews` table — never a cached column. See
+  [docs/architecture.md](docs/architecture.md), "Reviews & ratings," for the full model.
 
 Other product features (refunds, payouts, subscriptions, wallets, notifications, AI) are not
 implemented yet and are separate milestones.

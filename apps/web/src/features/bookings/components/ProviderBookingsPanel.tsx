@@ -2,11 +2,12 @@ import { useState } from "react"
 import { Link } from "@tanstack/react-router"
 import { Button } from "@/components/ui/button"
 import { toErrorMessage } from "@/lib/api/errors"
-import { useBookings, useCancelBooking } from "../hooks"
+import { useBookings, useCancelBooking, useCompleteBooking } from "../hooks"
 
 export function ProviderBookingsPanel({ providerId }: { providerId: string }) {
   const { data, isLoading, isError } = useBookings({ providerId })
   const cancelBooking = useCancelBooking()
+  const completeBooking = useCompleteBooking()
   const [error, setError] = useState<string | null>(null)
 
   async function handleCancel(bookingId: string) {
@@ -16,6 +17,16 @@ export function ProviderBookingsPanel({ providerId }: { providerId: string }) {
       await cancelBooking.mutateAsync(bookingId)
     } catch (err) {
       setError(await toErrorMessage(err, "Could not cancel this booking"))
+    }
+  }
+
+  async function handleComplete(bookingId: string) {
+    if (!window.confirm("Mark this booking as completed? This lets the customer leave a review.")) return
+    setError(null)
+    try {
+      await completeBooking.mutateAsync(bookingId)
+    } catch (err) {
+      setError(await toErrorMessage(err, "Could not mark this booking complete"))
     }
   }
 
@@ -40,6 +51,7 @@ export function ProviderBookingsPanel({ providerId }: { providerId: string }) {
         <ul className="flex flex-col gap-2" data-testid="provider-bookings-list">
           {data.bookings.map((booking) => {
             const canCancel = booking.status === "PENDING" || booking.status === "CONFIRMED"
+            const canComplete = booking.status === "CONFIRMED"
             // Same legitimacy rule the API enforces for medical-record
             // access (CONFIRMED/COMPLETED only) — a PENDING or CANCELLED
             // booking never establishes a treating relationship, so the
@@ -65,6 +77,17 @@ export function ProviderBookingsPanel({ providerId }: { providerId: string }) {
                     >
                       Medical records
                     </Link>
+                  )}
+                  {canComplete && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onPress={() => handleComplete(booking.id)}
+                      isDisabled={completeBooking.isPending}
+                      data-testid="provider-booking-complete-button"
+                    >
+                      Mark complete
+                    </Button>
                   )}
                   {canCancel && (
                     <Button
