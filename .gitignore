@@ -4,6 +4,8 @@ build/
 .env
 .env.local
 .env.*.local
+.env.production
+.env.*.production
 *.log
 npm-debug.log*
 .DS_Store
@@ -14,3 +16,5 @@ test-results/
 .vite/
 pgdata/
 *.tsbuildinfo
+
+.vercel

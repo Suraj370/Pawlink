@@ -1,5 +1,6 @@
 import { useState } from "react"
 import { Button } from "@/components/ui/button"
+import { Input, Label } from "@/components/ui/input"
 import { toErrorMessage } from "@/lib/api/errors"
 import { useRegister } from "../hooks"
 import { registerSchema } from "../schemas"
@@ -38,56 +39,52 @@ export function RegisterForm({ onSuccess }: Props) {
 
   return (
     <form onSubmit={handleSubmit} className="flex flex-col gap-4" noValidate>
-      <label className="flex flex-col gap-1 text-sm">
+      <Label>
         Name
-        <input
+        <Input
           type="text"
           value={name}
           onChange={(e) => setName(e.target.value)}
-          className="rounded border border-border bg-background px-3 py-2 text-sm"
           autoComplete="name"
           required
         />
-      </label>
-      <label className="flex flex-col gap-1 text-sm">
+      </Label>
+      <Label>
         Email
-        <input
+        <Input
           type="email"
           value={email}
           onChange={(e) => setEmail(e.target.value)}
-          className="rounded border border-border bg-background px-3 py-2 text-sm"
           autoComplete="email"
           required
         />
-      </label>
-      <label className="flex flex-col gap-1 text-sm">
+      </Label>
+      <Label>
         Phone
-        <input
+        <Input
           type="tel"
           value={phone}
           onChange={(e) => setPhone(e.target.value)}
-          className="rounded border border-border bg-background px-3 py-2 text-sm"
           autoComplete="tel"
           required
         />
-      </label>
-      <label className="flex flex-col gap-1 text-sm">
+      </Label>
+      <Label>
         Password
-        <input
+        <Input
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
-          className="rounded border border-border bg-background px-3 py-2 text-sm"
           autoComplete="new-password"
           required
         />
-      </label>
+      </Label>
       {(fieldError ?? submitError) && (
         <p role="alert" className="text-sm text-destructive" data-testid="register-error">
           {fieldError ?? submitError}
         </p>
       )}
-      <Button type="submit" isDisabled={register.isPending}>
+      <Button type="submit" isDisabled={register.isPending} className="mt-2 h-10 w-full">
         {register.isPending ? "Creating account…" : "Create account"}
       </Button>
     </form>

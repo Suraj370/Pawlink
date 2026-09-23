@@ -1,5 +1,6 @@
 import { useState } from "react"
 import { Button } from "@/components/ui/button"
+import { Input, Label } from "@/components/ui/input"
 import { toErrorMessage } from "@/lib/api/errors"
 import { useLogin } from "../hooks"
 import { loginSchema } from "../schemas"
@@ -36,34 +37,32 @@ export function LoginForm({ onSuccess }: Props) {
 
   return (
     <form onSubmit={handleSubmit} className="flex flex-col gap-4" noValidate>
-      <label className="flex flex-col gap-1 text-sm">
+      <Label>
         Email
-        <input
+        <Input
           type="email"
           value={email}
           onChange={(e) => setEmail(e.target.value)}
-          className="rounded border border-border bg-background px-3 py-2 text-sm"
           autoComplete="email"
           required
         />
-      </label>
-      <label className="flex flex-col gap-1 text-sm">
+      </Label>
+      <Label>
         Password
-        <input
+        <Input
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
-          className="rounded border border-border bg-background px-3 py-2 text-sm"
           autoComplete="current-password"
           required
         />
-      </label>
+      </Label>
       {(fieldError ?? submitError) && (
         <p role="alert" className="text-sm text-destructive" data-testid="login-error">
           {fieldError ?? submitError}
         </p>
       )}
-      <Button type="submit" isDisabled={login.isPending}>
+      <Button type="submit" isDisabled={login.isPending} className="mt-2 h-10 w-full">
         {login.isPending ? "Signing in…" : "Sign in"}
       </Button>
     </form>
