@@ -20,6 +20,7 @@ import { Route as AuthenticatedBookingsIndexRouteImport } from './routes/_authen
 import { Route as AuthenticatedBookingsBookingIdRouteImport } from './routes/_authenticated/bookings/$bookingId'
 import { Route as AuthenticatedPetsIndexRouteImport } from './routes/_authenticated/pets/index'
 import { Route as AuthenticatedPetsPetIdRouteImport } from './routes/_authenticated/pets/$petId'
+import { Route as AuthenticatedProviderMedicalRecordsPetIdRouteImport } from './routes/_authenticated/provider-medical-records/$petId'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -77,6 +78,12 @@ const AuthenticatedPetsPetIdRoute = AuthenticatedPetsPetIdRouteImport.update({
   path: '/pets/$petId',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
+const AuthenticatedProviderMedicalRecordsPetIdRoute =
+  AuthenticatedProviderMedicalRecordsPetIdRouteImport.update({
+    id: '/provider-medical-records/$petId',
+    path: '/provider-medical-records/$petId',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -87,6 +94,7 @@ export interface FileRoutesByFullPath {
   '/providers/': typeof ProvidersIndexRoute
   '/bookings/$bookingId': typeof AuthenticatedBookingsBookingIdRoute
   '/pets/$petId': typeof AuthenticatedPetsPetIdRoute
+  '/provider-medical-records/$petId': typeof AuthenticatedProviderMedicalRecordsPetIdRoute
   '/bookings/': typeof AuthenticatedBookingsIndexRoute
   '/pets/': typeof AuthenticatedPetsIndexRoute
 }
@@ -99,6 +107,7 @@ export interface FileRoutesByTo {
   '/providers': typeof ProvidersIndexRoute
   '/bookings/$bookingId': typeof AuthenticatedBookingsBookingIdRoute
   '/pets/$petId': typeof AuthenticatedPetsPetIdRoute
+  '/provider-medical-records/$petId': typeof AuthenticatedProviderMedicalRecordsPetIdRoute
   '/bookings': typeof AuthenticatedBookingsIndexRoute
   '/pets': typeof AuthenticatedPetsIndexRoute
 }
@@ -113,6 +122,7 @@ export interface FileRoutesById {
   '/providers/': typeof ProvidersIndexRoute
   '/_authenticated/bookings/$bookingId': typeof AuthenticatedBookingsBookingIdRoute
   '/_authenticated/pets/$petId': typeof AuthenticatedPetsPetIdRoute
+  '/_authenticated/provider-medical-records/$petId': typeof AuthenticatedProviderMedicalRecordsPetIdRoute
   '/_authenticated/bookings/': typeof AuthenticatedBookingsIndexRoute
   '/_authenticated/pets/': typeof AuthenticatedPetsIndexRoute
 }
@@ -127,6 +137,7 @@ export interface FileRouteTypes {
     | '/providers/'
     | '/bookings/$bookingId'
     | '/pets/$petId'
+    | '/provider-medical-records/$petId'
     | '/bookings/'
     | '/pets/'
   fileRoutesByTo: FileRoutesByTo
@@ -139,6 +150,7 @@ export interface FileRouteTypes {
     | '/providers'
     | '/bookings/$bookingId'
     | '/pets/$petId'
+    | '/provider-medical-records/$petId'
     | '/bookings'
     | '/pets'
   id:
@@ -152,6 +164,7 @@ export interface FileRouteTypes {
     | '/providers/'
     | '/_authenticated/bookings/$bookingId'
     | '/_authenticated/pets/$petId'
+    | '/_authenticated/provider-medical-records/$petId'
     | '/_authenticated/bookings/'
     | '/_authenticated/pets/'
   fileRoutesById: FileRoutesById
@@ -244,6 +257,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedPetsPetIdRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
+    '/_authenticated/provider-medical-records/$petId': {
+      id: '/_authenticated/provider-medical-records/$petId'
+      path: '/provider-medical-records/$petId'
+      fullPath: '/provider-medical-records/$petId'
+      preLoaderRoute: typeof AuthenticatedProviderMedicalRecordsPetIdRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
   }
 }
 
@@ -251,6 +271,7 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedDashboardRoute: typeof AuthenticatedDashboardRoute
   AuthenticatedBookingsBookingIdRoute: typeof AuthenticatedBookingsBookingIdRoute
   AuthenticatedPetsPetIdRoute: typeof AuthenticatedPetsPetIdRoute
+  AuthenticatedProviderMedicalRecordsPetIdRoute: typeof AuthenticatedProviderMedicalRecordsPetIdRoute
   AuthenticatedBookingsIndexRoute: typeof AuthenticatedBookingsIndexRoute
   AuthenticatedPetsIndexRoute: typeof AuthenticatedPetsIndexRoute
 }
@@ -259,6 +280,8 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedDashboardRoute: AuthenticatedDashboardRoute,
   AuthenticatedBookingsBookingIdRoute: AuthenticatedBookingsBookingIdRoute,
   AuthenticatedPetsPetIdRoute: AuthenticatedPetsPetIdRoute,
+  AuthenticatedProviderMedicalRecordsPetIdRoute:
+    AuthenticatedProviderMedicalRecordsPetIdRoute,
   AuthenticatedBookingsIndexRoute: AuthenticatedBookingsIndexRoute,
   AuthenticatedPetsIndexRoute: AuthenticatedPetsIndexRoute,
 }

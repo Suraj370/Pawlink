@@ -6,6 +6,7 @@ import {
   doublePrecision,
   index,
   integer,
+  jsonb,
   pgEnum,
   pgTable,
   primaryKey,
@@ -19,10 +20,13 @@ import {
   varchar,
 } from "drizzle-orm/pg-core";
 import {
+  AUDIT_ACTION_VALUES,
   BOOKING_STATUS_VALUES,
   DAY_OF_WEEK_VALUES,
   DEFAULT_CURRENCY,
   EXCEPTION_TYPE_VALUES,
+  MEDICAL_RECORD_STATUS_VALUES,
+  MEDICAL_RECORD_TYPE_VALUES,
   PAYMENT_STATUS_VALUES,
   PET_SEX_VALUES,
   PROVIDER_STATUS_VALUES,
@@ -445,5 +449,115 @@ export const paymentWebhookEvents = pgTable(
   },
   (table) => ({
     providerEventUnique: unique("payment_webhook_events_provider_event_id_unique").on(table.provider, table.eventId),
+  }),
+);
+
+export const medicalRecordTypeEnum = pgEnum("medical_record_type", MEDICAL_RECORD_TYPE_VALUES);
+export const medicalRecordStatusEnum = pgEnum("medical_record_status", MEDICAL_RECORD_STATUS_VALUES);
+
+// The core sensitive-data table for this milestone. See
+// docs/architecture.md, "Medical records," for the full authorization
+// model; the short version enforced everywhere this table is touched
+// (never at the client):
+//
+//   caller may read/write  <=>  caller owns the pet (read-only)
+//                           OR  caller owns a provider with a legitimate
+//                               (CONFIRMED/COMPLETED) booking against
+//                               this exact pet
+//
+// pet_id/provider_id/booking_id/created_by_user_id are all RESTRICT (never
+// CASCADE, never SET NULL) — a medical record is a historical business
+// record and none of its identity fields may ever be silently orphaned or
+// rewritten by something else being deleted. In practice this means a pet
+// with medical history can no longer be hard-deleted through
+// DELETE /api/pets/:id (routes/pets.ts already turns the resulting FK
+// violation into a clean 409, the same way it already does for bookings).
+//
+// `details` is a small, per-record-type structured JSONB object — see
+// packages/shared/src/medical-records.ts's detailsSchemaForType for the
+// exact shape per record_type, validated on every write and never trusted
+// as pre-validated on read.
+//
+// Records are never hard-deleted. The only lifecycle transition is
+// ACTIVE -> ARCHIVED (see archive_shape check below); there is no
+// un-archive and no DELETE endpoint at all.
+export const medicalRecords = pgTable(
+  "medical_records",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    petId: uuid("pet_id")
+      .notNull()
+      .references(() => pets.id, { onDelete: "restrict" }),
+    providerId: uuid("provider_id")
+      .notNull()
+      .references(() => providers.id, { onDelete: "restrict" }),
+    bookingId: uuid("booking_id").references(() => bookings.id, { onDelete: "restrict" }),
+    recordType: medicalRecordTypeEnum("record_type").notNull(),
+    title: varchar("title", { length: 200 }).notNull(),
+    description: text("description"),
+    details: jsonb("details").notNull().default({}),
+    recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull(),
+    status: medicalRecordStatusEnum("status").notNull().default("ACTIVE"),
+    archivedAt: timestamp("archived_at", { withTimezone: true }),
+    archivedReason: varchar("archived_reason", { length: 500 }),
+    createdByUserId: uuid("created_by_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    petIdIdx: index("medical_records_pet_id_idx").on(table.petId),
+    providerIdIdx: index("medical_records_provider_id_idx").on(table.providerId),
+    // Covers the exact predicate the pet-scoped list endpoint uses: WHERE
+    // pet_id = ? AND status = ? ORDER BY recorded_at DESC.
+    petStatusIdx: index("medical_records_pet_status_idx").on(table.petId, table.status),
+    createdAtIdx: index("medical_records_created_at_idx").on(table.createdAt),
+    archiveShapeCheck: check(
+      "medical_records_archive_shape",
+      sql`(${table.status} = 'ACTIVE' AND ${table.archivedAt} IS NULL)
+          OR (${table.status} = 'ARCHIVED' AND ${table.archivedAt} IS NOT NULL)`,
+    ),
+  }),
+);
+
+export const auditActionEnum = pgEnum("audit_action", AUDIT_ACTION_VALUES);
+
+// Append-only. No route in this codebase ever UPDATEs or DELETEs a row in
+// this table — see docs/architecture.md, "Audit logging." actor_user_id
+// is RESTRICT (an account that has authored audit history can't be hard-
+// deleted out from under it — moot today since there is no user-deletion
+// endpoint at all). pet_id/provider_id are SET NULL on delete: unlike
+// medical_records itself, the audit trail's job is to outlive the
+// resources it describes, not to pin them in place — deleting a pet must
+// never be blocked by its own audit history.
+export const auditLogs = pgTable(
+  "audit_logs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    actorUserId: uuid("actor_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    action: auditActionEnum("action").notNull(),
+    resourceType: varchar("resource_type", { length: 50 }).notNull(),
+    // Deliberately not a foreign key: resource_type varies (today always
+    // "medical_record", but the enum already anticipates other resources)
+    // and a denied/failed access may reference an id that was never valid
+    // to begin with. Never used for cascade behavior.
+    resourceId: uuid("resource_id"),
+    petId: uuid("pet_id").references(() => pets.id, { onDelete: "set null" }),
+    providerId: uuid("provider_id").references(() => providers.id, { onDelete: "set null" }),
+    // Small operational context only (e.g. {"recordType":"VISIT"} or
+    // {"changedFields":["title","recordedAt"]}) — never medical content.
+    // See docs/architecture.md, "Sensitive data handling."
+    metadata: jsonb("metadata"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    actorUserIdIdx: index("audit_logs_actor_user_id_idx").on(table.actorUserId),
+    petIdIdx: index("audit_logs_pet_id_idx").on(table.petId),
+    providerIdIdx: index("audit_logs_provider_id_idx").on(table.providerId),
+    resourceIdx: index("audit_logs_resource_idx").on(table.resourceType, table.resourceId),
+    createdAtIdx: index("audit_logs_created_at_idx").on(table.createdAt),
   }),
 );

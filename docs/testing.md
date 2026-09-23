@@ -209,6 +209,60 @@ genuine race condition to prove correct:
   webhook arriving after the booking was independently cancelled leaves the payment `SUCCEEDED` but
   the booking `CANCELLED` (the documented, intentional no-op — see docs/architecture.md).
 
+### 7. Medical records tests (`apps/api/src/medical-records.test.ts`, `apps/api/src/medical-records-security.test.ts`)
+
+Split into two files because the security/audit matrix is large enough to deserve its own file
+rather than being woven into the general CRUD tests, unlike every earlier resource — this is the one
+feature where authorization and auditability *are* the feature, not a secondary property of it.
+
+- **`medical-records.test.ts`** — the general shape every other resource's test file has: valid
+  creation, per-record-type `details` validation (a `VACCINATION` missing `vaccineName` is rejected;
+  an unknown key inside `details` is rejected — no arbitrary data dumping ground), oversized-field
+  rejection, listing with `recordType`/`includeArchived` filters, `PATCH` amendment (content changes
+  accepted, identity fields silently ignored), the archive lifecycle (`ACTIVE -> ARCHIVED`, archiving
+  twice is `409`, there is no `DELETE` route at all — asserted both by hitting the endpoint and by
+  independently re-querying the database row is still there), and that deleting a pet with medical
+  history now returns the same clean `409` deleting one with booking history already did. It also
+  proves the deliberate no-admin-bypass decision directly: an admin with no treating relationship
+  still gets `404` for an unrelated pet's records.
+- **`medical-records-security.test.ts`** — the mandatory authorization matrix and the audit trail,
+  each as their own `describe` block:
+  - **Authorization matrix**: every scenario the milestone brief calls out by name — customer→own
+    pet (allowed), customer→another customer's pet (`404`, never `403`), provider→legitimately
+    treated pet (allowed), provider→unrelated pet (`404`), provider A→provider B's pet/record
+    (`404`), customer attempting the provider-only create mutation (`403`, not silently allowed),
+    a fake `providerId`/`createdByUserId`/`bookingId` each independently rejected or ignored, a
+    cross-provider booking (`Provider A + Pet B + a real booking belonging to Provider C`) rejected,
+    sequential/random record-id enumeration never disclosing content, `PENDING`/`CANCELLED` bookings
+    never establishing a relationship, a co-treating-but-non-authoring provider allowed to *read* but
+    denied *writing* to another provider's record, and a pet owner denied both amending and archiving
+    a provider-authored record.
+  - **Audit trail**: a `MEDICAL_RECORD_CREATED`/`VIEWED`/`UPDATED`/`ARCHIVED` event is written for
+    the matching action and attributed to the correct actor; `AUTHORIZATION_DENIED` is written for a
+    denied detail-record read without leaking the record's content in the response *or* in the
+    audit row's own `metadata`; there is no HTTP route to `PATCH`/`DELETE` an audit log entry
+    (`/api/audit-logs/:id` simply doesn't exist — proven by hitting it and getting the app's generic
+    `404`); a concurrent create+update+read against the same record produces a fully attributed trail
+    queryable by the database's own `id`/`created_at`, never relying on in-process JS ordering.
+  - **Historical integrity**: create → read → update preserves `id`/`petId`/`providerId`/
+    `createdByUserId`/`createdAt` exactly, with only the intentionally-amended field changed.
+
+### 8. Medical records Playwright specs (`e2e/medical-records.spec.ts`)
+
+Two full real-browser workflows, both built on the same confirmed-booking setup `bookings.spec.ts`
+already establishes (provider + service + weekly hours, customer + pet, a slot booked and paid
+through the mock provider to `CONFIRMED`):
+
+- **Provider workflow**: from the provider's own bookings panel (never a typed-in pet id), click
+  through to the treated pet's medical records, see the empty state, add a `VISIT` record via the
+  real form, see it appear in the list — then, from a third, unrelated browser context, prove
+  directly against the API that a stranger provider gets `404` for the same pet.
+- **Customer workflow**: the provider adds a `VACCINATION` record; the pet's own owner opens their
+  pet page and sees it (title, type, and the vaccine-specific summary) with no "Add medical record"
+  control ever rendered (read-only enforced in the UI, not just the API) — and a second, unrelated
+  customer's own unrelated pet shows neither the record nor even an "Add" control, proving the
+  history never leaks across pets that happen to be viewed in the same UI shell.
+
 ## What "passing" actually means here
 
 Every milestone's final verification runs the *entire* existing suite, not just the new resource's

@@ -3,8 +3,8 @@
 A multi-sided pet-care platform connecting pet parents, vets, groomers, boarding providers, and
 platform administrators. This repository currently implements the project foundation,
 authentication, pet management, provider management, service management, availability management,
-the booking engine, and a payment abstraction with a deterministic mock provider — no other business
-features are implemented yet.
+the booking engine, a payment abstraction with a deterministic mock provider, and a secure, audited
+medical-records system — no other business features are implemented yet.
 
 ## Stack
 
@@ -37,10 +37,10 @@ Full setup details, environment variables, and prerequisites live in
 
 ```text
 apps/
-  api/      Hono API service (health check, auth, pets, providers, services, availability, bookings, payments)
+  api/      Hono API service (health check, auth, pets, providers, services, availability, bookings, payments, medical records)
   web/      React/Vite frontend (TanStack Router/Query, Ky, shadcn/Tailwind UI)
 packages/
-  shared/   Shared types & Zod schemas (health, auth, pets, providers, services, availability, bookings, payments)
+  shared/   Shared types & Zod schemas (health, auth, pets, providers, services, availability, bookings, payments, medical records, audit)
 e2e/        Playwright end-to-end tests
 docs/       Project documentation
 ```
@@ -64,6 +64,7 @@ and what each layer of the test suite covers.
 |                | `GET/POST /api/providers/:providerId/availability/exceptions[/:exceptionId]` (+ `PATCH`/`DELETE`) | owner/admin |
 | Bookings       | `POST/GET /api/bookings`, `GET /api/bookings/:id`, `POST /api/bookings/:id/cancel`               | authenticated |
 | Payments       | `POST/GET /api/bookings/:bookingId/payment`, `GET /api/payments/:id`, `POST /api/payments/webhook` | authenticated (webhook: signature-verified, not session) |
+| Medical records | `GET/POST /api/pets/:petId/medical-records`, `GET/PATCH /api/medical-records/:id`, `POST /api/medical-records/:id/archive` | pet owner (read) / treating provider (read+write) — see below |
 
 Every mutating endpoint derives ownership from the authenticated session, never from a
 client-supplied id. Full request/response shapes and the authorization model are documented in
@@ -117,8 +118,21 @@ client-supplied id. Full request/response shapes and the authorization model are
   money transfer exists anywhere in this codebase — see [docs/architecture.md](docs/architecture.md),
   "Payments," for the full design, including the exact consistency guarantees.
 
-Other product features (refunds, payouts, subscriptions, wallets, medical records, notifications, AI)
-are not implemented yet and are separate milestones.
+- **Medical records**: providers with a legitimate, confirmed treating relationship to a pet
+  (established from real booking history, never a client-supplied id) can record visits,
+  diagnoses, vaccinations, medications, allergies, lab results, and surgeries
+  (`POST /api/pets/:petId/medical-records`); the pet's owner can always read their own pet's full
+  history (`GET /api/pets/:petId/medical-records`). A pet ID alone is never an authorization
+  credential — every read and write is independently re-verified against the caller's session and
+  real database state. Records are never hard-deleted (only `ACTIVE -> ARCHIVED`); corrections go
+  through `PATCH`, restricted to the exact authoring provider, and every create/view/update/archive
+  and every denied attempt is recorded in an append-only audit log
+  (`MEDICAL_RECORD_CREATED/VIEWED/UPDATED/ARCHIVED`, `AUTHORIZATION_DENIED`) that never duplicates
+  medical content. See [docs/architecture.md](docs/architecture.md), "Medical records," for the
+  full authorization model and its rationale.
+
+Other product features (refunds, payouts, subscriptions, wallets, notifications, AI) are not
+implemented yet and are separate milestones.
 
 ## Testing
 

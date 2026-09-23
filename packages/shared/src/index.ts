@@ -15,3 +15,5 @@ export * from "./services.js";
 export * from "./availability.js";
 export * from "./bookings.js";
 export * from "./payments.js";
+export * from "./medical-records.js";
+export * from "./audit.js";

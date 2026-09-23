@@ -688,3 +688,197 @@ raw webhook payloads are never returned by any endpoint.
   happens via an explicit webhook delivery (exercised by tests and, for the mock provider's own
   deterministic model, would be the equivalent of a real provider's async confirmation). The frontend
   reflects this honestly with a "Check again" reload action rather than pretending to resolve it.
+
+## Medical records
+
+Medical records are the first genuinely sensitive data this codebase stores, so this milestone
+layers stronger authorization, auditability, and data-isolation guarantees on top of every pattern
+above — it is deliberately **not** treated like pets/providers/services CRUD.
+
+**The central rule, stated once so it can be referenced everywhere else: a pet ID is never an
+authorization credential.** Knowing a pet's UUID (from a URL, a network request, a support ticket)
+grants nothing by itself. Every read and write independently re-derives, from the authenticated
+session and real database state, whether the caller is that pet's owner or a provider with a real
+treating relationship to that pet — never from anything the client supplies.
+
+### Data model
+
+`medical_records` (`apps/api/src/db/schema.ts`): `pet_id`, `provider_id`, and `created_by_user_id`
+are `NOT NULL`; `booking_id` is nullable (a record can exist without being tied to one specific
+appointment, e.g. a provider backfilling history). All four are `RESTRICT` foreign keys — never
+`CASCADE`, never `SET NULL` — because a medical record is a historical business record and none of
+its identity fields may ever be silently orphaned or rewritten by something else being deleted. In
+practice this means **a pet with medical history can no longer be hard-deleted** through
+`DELETE /api/pets/:id`; that endpoint already turned the equivalent booking-history FK violation into
+a clean `409` (see Pet management, above) and now does the same for medical-record history, with an
+updated message covering both.
+
+`record_type` is a closed Postgres enum: `VISIT`, `DIAGNOSIS`, `VACCINATION`, `MEDICATION`,
+`ALLERGY`, `LAB_RESULT`, `SURGERY`, `OTHER` — never an arbitrary client-supplied string. Each type
+has its own small, strictly-shaped `details` object (stored as one JSONB column, validated by the
+matching Zod schema — `packages/shared/src/medical-records.ts`'s `detailsSchemaForType` — on every
+write and never trusted as pre-validated on read): a `VACCINATION` needs `vaccineName` +
+`administeredAt`; a `MEDICATION` needs `medicationName` + `dosage` + `frequency`; and so on. This is
+deliberately in between the milestone's two rejected extremes — one giant unstructured text field,
+or a dozen sparse nullable columns on the table — and every per-type schema uses `.strict()`, so an
+unknown key inside `details` is a validation error, not silently accepted data.
+
+Records are **never hard-deleted**. The only lifecycle transition is `ACTIVE -> ARCHIVED`
+(`POST /api/medical-records/:id/archive`), enforced by a hand-added `CHECK` constraint (drizzle-kit
+0.24.2 doesn't emit `CHECK` from the schema builder — the same documented gap as the
+services/bookings/availability-exceptions migrations) tying `archived_at` to `status`. There is no
+un-archive endpoint and no `DELETE` route anywhere in this feature.
+
+### Provider access model — the legitimate-relationship rule
+
+```
+caller may read/write a pet's medical records
+  <=>  caller owns the pet (read-only), OR
+  <=>  caller owns a `providers` row with at least one booking against
+       this exact pet whose status is CONFIRMED or COMPLETED
+```
+
+This is computed fresh on every request by `findAuthorizedProviderIds`
+(`apps/api/src/lib/medical-record.ts`) — a join over `providers` and `bookings` filtered to the
+caller's own `ownerUserId` and the target `petId`, never a value read once and reused, and never a
+client-supplied `providerId` taken at face value. `PENDING` bookings deliberately do **not** count —
+payment hasn't settled yet and the provider may never actually see the pet — and neither do
+`CANCELLED` ones. A client-supplied `providerId` in the create body is only ever checked for
+**membership** in that independently-derived set (a disambiguator for the rare case where a user
+owns more than one eligible provider business, never a credential); the same applies to a
+client-supplied `bookingId`, which is independently re-verified to belong to the exact pet and
+provider in question and to carry a legitimate status (`loadLegitimateBooking`) — this is the direct
+defense against "Provider A + Pet B + a real booking ID that actually belongs to Provider C."
+
+**Continuity of care**: once a provider has a current legitimate relationship with a pet, they see
+that pet's **entire** active medical history, including records authored by a different provider who
+also legitimately treats the same pet — matching how a real veterinary record system works. What a
+co-treating provider still cannot do is **write** to a record they didn't author: `PATCH` and
+`POST /:id/archive` additionally require `providers.ownerUserId === caller` **and**
+`providers.id === record.providerId` — the exact authoring provider, no exceptions, not even another
+provider who currently treats the same pet.
+
+Only a provider may `POST` a new record; a pet owner never can, even for their own pet. If the pet
+owner themselves attempts it, they get a `403` with a clear reason — they already know their own pet
+exists, so naming the reason leaks nothing. Anyone else (an unrelated provider, an unrelated
+customer, a provider whose relationship has since lapsed) gets the same `404` a nonexistent pet id
+would — this is the same IDOR-hiding convention used everywhere else in this codebase (see
+Foundation, above), now extended to hide *whether a treating relationship exists at all*, not just
+whether the pet itself exists.
+
+**Deliberate scope decision — no admin bypass.** Unlike bookings/services/providers, medical-record
+routes give `ADMIN` no special access; an admin follows the exact same owner/provider rules as
+anyone else. The milestone brief doesn't call for an admin oversight panel, and adding one would
+only grow the attack surface without a corresponding requirement — see
+`medical-records.test.ts`, "admin has no special medical-record access."
+
+### Record authorship and immutability
+
+`created_by_user_id` and `provider_id` are set from the authenticated session and the
+independently-derived authorized provider — there is structurally no field on
+`createMedicalRecordSchema` for a client to supply either one. `PATCH /api/medical-records/:id`
+(`updateMedicalRecordSchema`) only ever accepts `title`, `description`, `recordedAt`, and `details` —
+not `.strict()`, matching this codebase's established Zod policy of silently stripping unknown keys
+rather than rejecting the whole request (see `createBookingSchema`'s mass-assignment test) — so a
+client attempting to smuggle `petId`/`providerId`/`createdByUserId`/`createdAt` through a `PATCH`
+simply has those keys dropped before the route ever sees them, on top of the route itself never
+reading those keys off the parsed body. A correction is therefore always an in-place amendment of
+content, never a rewrite of identity — full before/after field-level history isn't kept in this
+first version (see Known limitations), but *that a correction happened, when, and by whom* always is
+(next section).
+
+### Audit logging
+
+`audit_logs` (`apps/api/src/lib/audit.ts`, `recordAuditEvent`) is the **only** place any row is ever
+written to that table — every sensitive route calls through this one function rather than inserting
+directly. It is **append-only**: there is no `PATCH`/`DELETE` endpoint for an audit log entry
+anywhere in this codebase (proven directly in `medical-records-security.test.ts`), and even an admin
+cannot rewrite history through any HTTP route in this milestone.
+
+Five actions are recorded: `MEDICAL_RECORD_CREATED`, `MEDICAL_RECORD_VIEWED` (on every authorized
+read — both a single-record detail fetch, `GET /api/medical-records/:id`, and a pet's list endpoint,
+`GET /api/pets/:petId/medical-records`, which writes **one** event per list request carrying only a
+row count in `metadata`, never one event per row — a bulk read of a pet's whole history is exactly
+the kind of access this audit trail exists to capture, and skipping it just because it's a list
+would leave the single largest read surface in this feature unaudited), `MEDICAL_RECORD_UPDATED`,
+`MEDICAL_RECORD_ARCHIVED`, and `AUTHORIZATION_DENIED` (written for denied writes and denied
+detail-record reads, capturing probing attempts without changing the response the caller sees). A
+write's audit event is inserted
+inside the **same database transaction** as the write itself (`db.transaction` in
+`routes/medical-records.ts`) — either both commit or neither does, which a separate post-commit write
+could never guarantee.
+
+`metadata` carries only small structural context — e.g. `{"recordType":"VISIT"}` on create, or
+`{"changedFields":["title","recordedAt"]}` on update — **never** medical content, verified directly
+in tests by asserting the metadata never contains the record's actual title/diagnosis text. Ordering
+and attribution rely entirely on the database's own `id`/`created_at`, never in-process JavaScript
+timing, so a concurrent create+update+read against the same record still produces a fully
+attributable, deterministically queryable trail.
+
+### Why no locking transaction around create (and why that's fine here)
+
+Booking creation (`routes/bookings.ts`) locks the `providers`/`services` rows with
+`SELECT ... FOR UPDATE` inside a transaction because those rows carry mutable state
+(`provider.status`, `service.active`) that a concurrent request can change between an unlocked read
+and commit, and because two concurrent bookings can race for the *same slot* — a real conflict this
+codebase must resolve deterministically. Medical-record creation has no equivalent: the "legitimate
+relationship" a create depends on is derived from **existing, already-committed** booking rows (a
+`CONFIRMED`/`COMPLETED` booking that already exists), and there is no endpoint anywhere in this
+codebase that revokes a booking's `CONFIRMED`/`COMPLETED` status once reached (cancellation only
+applies to still-blocking states, and there's no "undo a confirmed booking" action) — so there is no
+window in which the authorization check performed at the top of the handler could become stale by
+the time the `INSERT` runs. Two concurrent creates for the same pet+provider don't conflict with each
+other the way two bookings for the same slot do; each simply inserts its own row.
+
+### Response shape
+
+```json
+{
+  "id": "...", "petId": "...", "providerId": "...", "providerName": "Riverside Vet Clinic",
+  "bookingId": "...", "recordType": "VACCINATION", "title": "Rabies vaccine",
+  "description": null, "details": { "vaccineName": "Rabies", "administeredAt": "2026-01-20" },
+  "recordedAt": "2026-01-20T09:00:00.000Z", "status": "ACTIVE",
+  "archivedAt": null, "archivedReason": null, "createdByUserId": "...",
+  "createdAt": "...", "updatedAt": "..."
+}
+```
+
+Every field here is either identity/structural metadata or exactly what an authorized provider
+entered — there is no computed medical inference, recommendation, or AI-generated content anywhere
+in this response, matching the milestone's explicit non-goals below.
+
+### Frontend
+
+`apps/web/src/features/medical-records/` follows the same `{api,hooks,schemas,components}` shape as
+every other feature. `MedicalRecordsSection` is the single mount point used by both surfaces: the
+pet owner's own pet page (`/pets/$petId`, `canCreate={false}` — read-only, no archive action ever
+rendered) and a provider's patient view (`/provider-medical-records/$petId`, reached only from a
+`CONFIRMED`/`COMPLETED` booking row in `ProviderBookingsPanel`, never by a typed-in pet id). The
+provider route is deliberately keyed by `petId` alone, not `providerId` — the server derives the
+acting provider from the session exactly as every API route does, so the frontend never asserts a
+provider identity the backend would have to double-check anyway. `canCreate` and `canManage` only
+toggle which controls render; the server re-checks authorization independently on every request
+regardless of what the UI offers, so there's no client-side gate a direct API call could bypass.
+
+### Non-goals (explicitly out of scope for this milestone)
+
+Real medical diagnosis, AI-generated diagnosis or medical advice, prescription recommendations,
+pharmacy integration, insurance, laboratory system integrations, telemedicine, and notifications are
+all explicitly not implemented — this milestone is about **secure record storage and access**, not
+medical decision-making, matching the milestone brief precisely.
+
+### Known limitations
+
+- **No field-level amendment history.** A `PATCH` is audited (actor, timestamp, which field *names*
+  changed) but the previous *values* aren't separately retained — a future milestone wanting a full
+  diff/redline view would need an explicit revision table. What's guaranteed today is that a change
+  happened, when, and by whom, never that it happened silently.
+- **Attachments are deferred.** The repository has no existing safe file-storage abstraction (no
+  upload endpoint, no object-storage client — `pets.photoUrl` is just a freeform URL field, not a
+  storage integration) to build on, and the milestone brief explicitly says not to build arbitrary
+  file uploads to local disk or accept unvalidated external URLs as attachments. `medical_records`
+  has no attachment column; adding one is a clean, additive extension once a real storage
+  abstraction exists elsewhere in the codebase.
+- **No un-archive.** Archiving is one-directional through the API; reactivating a mistakenly-archived
+  record isn't supported yet (would need its own audited action, deliberately not added
+  speculatively).

@@ -4,6 +4,7 @@ import { Link, createFileRoute, useNavigate } from "@tanstack/react-router"
 import { Button } from "@/components/ui/button"
 import { PetForm } from "@/features/pets/components/PetForm"
 import { useDeletePet, usePet, useUpdatePet } from "@/features/pets/hooks"
+import { MedicalRecordsSection } from "@/features/medical-records/components/MedicalRecordsSection"
 
 export const Route = createFileRoute("/_authenticated/pets/$petId")({
   component: PetDetailsPage,
@@ -111,6 +112,7 @@ function PetDetailsPage() {
           {deletePet.isPending ? "Deleting…" : "Delete"}
         </Button>
       </div>
+      <MedicalRecordsSection petId={pet.id} canCreate={false} />
     </main>
   )
 }

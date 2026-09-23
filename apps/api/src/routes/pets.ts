@@ -136,12 +136,13 @@ export function createPetRoutes(db: DbClient, nodeEnv: string) {
     try {
       await db.delete(pets).where(and(eq(pets.id, idResult.data), eq(pets.ownerId, user.id)));
     } catch (err) {
-      // A pet with booking history can't be deleted — bookings.pet_id is a
-      // restrict (never cascade) FK precisely so a pet's booking history
-      // can never be silently destroyed. Surfaced as a clean 409 instead
-      // of a raw database error.
+      // A pet with booking or medical-record history can't be deleted —
+      // bookings.pet_id and medical_records.pet_id are both restrict
+      // (never cascade) FKs precisely so that history can never be
+      // silently destroyed. Surfaced as a clean 409 instead of a raw
+      // database error.
       if (isForeignKeyViolation(err)) {
-        return c.json({ error: "This pet has existing bookings and cannot be deleted" }, 409);
+        return c.json({ error: "This pet has existing bookings or medical records and cannot be deleted" }, 409);
       }
       throw err;
     }
